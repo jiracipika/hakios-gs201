@@ -1,0 +1,4 @@
+# HakiOS defconfig for the Pixel 7 (panther): the common kernel, the gs201 family's facts, and this device's own.
+#include common_defconfig
+#include gs201.config
+#include panther.config
