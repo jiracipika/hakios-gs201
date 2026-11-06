@@ -81,7 +81,9 @@ const struct pc_seq_step PC_SEQ_UW_DOWN[] = {
     { "pp3200_bb",          PC_REGULATOR, 0 },
 };
 
-static const struct pc_module pc_modules[] = {
+/* PC_MODULES defined directly (a second copy initialized from the first is not a
+   compile-time constant in C — rejected by clang/gcc alike). */
+const struct pc_module PC_MODULES[] = {
     { "svarog",    "front",     PC_BUS_FRONT, PC_I2C_ADDR_FRONT_SVAROG,
       PC_SEQ_FRONT_UP, 7, PC_SEQ_FRONT_DOWN, 7 },
     { "barghest",  "rear-main", PC_BUS_MAIN,  PC_I2C_ADDR_MAIN_BARGHEST,
@@ -89,7 +91,6 @@ static const struct pc_module pc_modules[] = {
     { "imentet",   "rear-uw",   PC_BUS_UW,    PC_I2C_ADDR_UW_IMENTET,
       PC_SEQ_UW_UP, 9, PC_SEQ_UW_DOWN, 9 },
 };
-const struct pc_module PC_MODULES[] = { pc_modules[0], pc_modules[1], pc_modules[2] };
 const size_t PC_MODULE_COUNT = 3;
 
 static int run_seq(const struct pc_seq_step *s, size_t n, const struct pc_board_ops *ops,

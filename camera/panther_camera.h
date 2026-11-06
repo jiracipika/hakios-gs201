@@ -10,6 +10,7 @@
 #define PANTHER_CAMERA_H
 
 #include <stdint.h>
+#include <stddef.h>   /* size_t in the module descriptors below */
 
 /* ---- i2c addresses / buses (dtbo: sensor@N / actuator@N / ... node facts) ---- */
 #define PC_I2C_ADDR_FRONT_SVAROG     0x10   /* sensor@1  node-name sensor-svarog */
