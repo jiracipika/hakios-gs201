@@ -46,11 +46,14 @@ _start:
     mrs     x23, mpidr_el1
     mrs     x24, midr_el1
 
-    /* stack: image offset STACK_TOP_OFF (256 KiB down), inside the mapped
-       decompressed-image window by construction */
-    movz    x25, #0x0000
-    movk    x25, #0x1c4, lsl #16          /* 0x01c40000 */
-    add     sp, x22, x25
+    /* stack: image offset STACK_TOP_OFF (0x1c40000), inside the mapped
+       decompressed-image window by construction. x22 is the BLOB address
+       (img + AEP), so subtract (AEP - STACK_TOP_OFF) = 0xea458. Getting this
+       wrong parks the stack past the image end — unmapped — and every C
+       stack access faults: the all-day 105 s floor bug. */
+    movz    x25, #0xa458
+    movk    x25, #0x000e, lsl #16         /* 0xea458 */
+    sub     sp, x22, x25                 /* sp = img + 0x1c40000 */
 
     /* m2ld_main(abl_x0, abl_x1, self, mpidr, el, midr) */
     mov     x0, x19
@@ -102,7 +105,7 @@ m2ld_jump:
 m2ld_return_stub:
     msr     daifset, #0xf
     movz    x10, #0xf000
-    movk    x10, #0xfd3f, lsl #16         /* 0xfd3ff000 */
+    movk    x10, #0xfd3f, lsl #16         /* 0xfd3ff000 (console zone) */
     movz    w11, #0x5255
     movk    w11, #0x5455, lsl #16         /* "URET" */
     str     w11, [x10, #0x800]
@@ -114,7 +117,76 @@ m2ld_return_stub:
     str     x5, [x10, #0x830]
     str     x6, [x10, #0x838]
     str     x7, [x10, #0x840]
+    /* mirror the record into the pmsg zone (TWRP-exposed) */
+    movz    x11, #0xf000
+    movk    x11, #0xfd5f, lsl #16         /* 0xfd5ff000 */
+    str     w11, [x11, #0x800]
+    str     x0, [x11, #0x808]
+    str     x1, [x11, #0x810]
+    str     x2, [x11, #0x818]
+    str     x3, [x11, #0x820]
+    str     x4, [x11, #0x828]
+    str     x5, [x11, #0x830]
+    str     x6, [x11, #0x838]
+    str     x7, [x11, #0x840]
+    /* advance the ring headers past our record (both zones): start/size =
+       max(current, 0x900) so the next kernel appends after, not over, us */
+    ldr     w14, [x10, #4]
+    cmp     w14, #0x900
+    b.ge    6f
+    movz    w14, #0x0900
+    str     w14, [x10, #4]
+    str     w14, [x10, #8]
+6:  ldr     w14, [x11, #4]
+    cmp     w14, #0x900
+    b.ge    7f
+    movz    w14, #0x0900
+    str     w14, [x11, #4]
+    str     w14, [x11, #8]
+7:
+    /* preset recovery boot mode via EL3 (report regs already stored) */
+    movz    x0, #0x0504
+    movk    x0, #0x8200, lsl #16         /* SMC FID 0x82000504 */
+    mov     x1, #0xff
+    smc     #0
+    ldr     x0, =0x18060810
+    movz    w1, #0x00ff
+    str     w1, [x0]
     dsb     sy
+    /* arm the reset per reason: x2==1 (early exception) -> INSTANT (~30 s
+       band); x2==2 (checkpoint) -> ~20 s window (~55-65 s band). The band
+       itself is the observable: it proves XNU executed real kernel code and
+       returned through the slot. */
+    cmp     x2, #2
+    b.ne    8f
+    movz    w15, #0x3000
+    movk    w15, #0x000e, lsl #16        /* WTCNT = 0xE3000 ~= 20 s */
+    b       9f
+8:  mov     w15, #0x80                   /* instant window violation */
+9:  movz    x13, #0x4000
+    movk    x13, #0x200c, lsl #16        /* WDT_CL0 */
+    movz    w14, #0xffee
+    movk    w14, #0xc0, lsl #16          /* 0xc0ffee KEY */
+    str     w14, [x13, #4]
+    str     wzr, [x13]
+    mov     w14, #0x100
+    str     w14, [x13, #16]              /* WTMINCNT */
+    str     w15, [x13, #8]               /* WTCNT */
+    movz    w14, #0x2021
+    movk    w14, #0x10, lsl #16
+    str     w14, [x13]
+    movz    x13, #0x5000
+    movk    x13, #0x200c, lsl #16        /* WDT_CL1 */
+    movz    w14, #0xffee
+    movk    w14, #0xc0, lsl #16
+    str     w14, [x13, #4]
+    str     wzr, [x13]
+    mov     w14, #0x100
+    str     w14, [x13, #16]
+    str     w15, [x13, #8]
+    movz    w14, #0x2021
+    movk    w14, #0x10, lsl #16
+    str     w14, [x13]
     /* clean the record + plog head so they survive the reset */
     add     x12, x10, #0x7c0
     add     x15, x10, #0x900
@@ -129,35 +201,8 @@ m2ld_return_stub:
     cmp     x12, x15
     b.lo    2b
     dsb     sy
-    /* instant reset on both cluster watchdogs: direct MMIO, no calls */
-    movz    x13, #0x4000
-    movk    x13, #0x200c, lsl #16
-    movz    w14, #0xffee
-    movk    w14, #0xc0, lsl #16           /* 0xc0ffee */
-    str     w14, [x13, #4]
-    str     wzr, [x13]
-    mov     w14, #0x100
-    str     w14, [x13, #16]
-    mov     w14, #0x80
-    str     w14, [x13, #8]
-    movz    w14, #0x2021
-    movk    w14, #0x10, lsl #16
-    str     w14, [x13]
-    movz    x13, #0x5000
-    movk    x13, #0x200c, lsl #16
-    movz    w14, #0xffee
-    movk    w14, #0xc0, lsl #16
-    str     w14, [x13, #4]
-    str     wzr, [x13]
-    mov     w14, #0x100
-    str     w14, [x13, #16]
-    mov     w14, #0x80
-    str     w14, [x13, #8]
-    movz    w14, #0x2021
-    movk    w14, #0x10, lsl #16
-    str     w14, [x13]
-3:  wfe
-    b       3b
+10: wfe
+    b       10b
 
 /* m2ld_clean(va, len) — clean D-cache to PoC for a range (must cover every
    region the loader wrote that XNU will read before its own cache setup). */
@@ -213,9 +258,9 @@ m2_fault_common:
     add     x8, x8, #1
     stlr    x8, [x7]
 3:
-    /* advance ELR by 4 for sync-abort slots (offset%0x200 == 0) only */
-    tst     x0, #0x1ff
-    b.ne    4f
+    /* advance ELR by 4 for EVERY slot: sync aborts need the skip, and an
+       SError returned to the same instruction would loop forever (v6 hang).
+       DAIF is masked, so a real IRQ never reaches here. */
     add     x3, x3, #4
     cmp     x6, #2
     b.eq    31f

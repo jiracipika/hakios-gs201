@@ -24,8 +24,8 @@ NM="${NM:-nm}"
 
 AEP=0x1d2a458
 SIZEOFIMG=0x22e7a00
-GSPE_OFF=0x0200000
-PRAM_OFF=0x1180000
+GSPE_OFF=0x0800000
+PRAM_OFF=0x1b00000
 VBMETA_OFF_EXPECT=$((0x1068000))
 
 [ -f "$KERN" ]  || { echo "kernel not found: $KERN"; exit 1; }
@@ -56,11 +56,74 @@ STOCK_KSZ=$(wc -c < "$T/stock-k.bin")
 # stock stream ends ~12KB below PE SizeOfImage; we only need its headers
 [ "$STOCK_KSZ" -ge $((0x10000)) ] || { echo "stock kernel decompressed short: $STOCK_KSZ"; exit 1; }
 
-# ---- 3) vehicle: zeros + stock headers + GSPE + m2ld ----
-truncate -s $((SIZEOFIMG)) "$T/veh.bin"
-dd if="$T/stock-k.bin" of="$T/veh.bin" bs=1 seek=0 count=$((0x10000)) status=none conv=notrunc
-dd if="$T/gspe.bin" of="$T/veh.bin" bs=1 seek=$((GSPE_OFF)) status=none conv=notrunc
-dd if=stage2/m2ld.bin of="$T/veh.bin" bs=1 seek=$((AEP)) status=none conv=notrunc
+# ---- 3) vehicle: the FULL stock kernel (proven shape — v13's decompressed
+# kernel is the entire stock content, not headers+zeros; a zeros vehicle is
+# never executed by ABL), GSPE and m2ld patched over it.
+# SIZE GATE (empirical, 12 runs): ABL executes only when compressed
+# kernel_size lands in ~[17.16M .. 17.195M] — the stream must nearly fill the
+# header->vbmeta span (z64k 17,159,067 works; V12 16,843,000 floors). Pad
+# with incompressible bytes until comfortably inside, under the budget.
+# Zero-run breaker: ABL's lz4 decoder chokes on contiguous zero runs longer
+# than ~64KB (stock images only carry scattered 4KB zero pages; a 1MB zeroed
+# region or the Mach-O payload's internal padding floors the boot). Fill every
+# zero run >= 0x2000 with a repeating 4KB pseudorandom block: stock-style
+# short match chains, ~4KB total compression cost.
+fill_zero_runs() {  # $1 = file, $2 = exempt start, $3 = exempt end
+  python3 - "$1" "$2" "$3" <<'PYZ'
+import sys, os
+path = sys.argv[1]
+ex_a, ex_b = int(sys.argv[2]), int(sys.argv[3])
+d = bytearray(open(path, 'rb').read())
+pat = os.urandom(4096)
+i, n, runs = 0x10000, len(d), 0    # never touch the Image/PE header region
+MIN = 0x2000
+def fill(i, j):
+    off = i
+    while off < j:
+        chunk = pat[:min(4096, j - off)]
+        d[off:off + len(chunk)] = chunk
+        off += len(chunk)
+while i < n:
+    if d[i] == 0:
+        j = i
+        while j < n and d[j] == 0:
+            j += 1
+        if j - i >= MIN and not (i >= ex_a and j <= ex_b):
+            fill(i, j)
+            runs += 1
+        i = j
+    else:
+        i += 1
+open(path, 'wb').write(d)
+sys.stderr.write("fill_zero_runs: %d runs filled\n" % runs)
+PYZ
+}
+
+build_veh() {  # $1 = pad size (0 = none)
+  cp "$T/stock-k.bin" "$T/veh.bin"
+  truncate -s $((SIZEOFIMG)) "$T/veh.bin"
+  dd if="$T/gspe.bin" of="$T/veh.bin" bs=4096 seek=$((GSPE_OFF/4096)) status=none conv=notrunc
+  M2LD_SZ=$(wc -c < stage2/m2ld.bin)
+  dd if=stage2/m2ld.bin of="$T/veh.bin" bs=1 seek=$((AEP)) status=none conv=notrunc
+  if [ "$1" -gt 0 ]; then
+    dd if=/dev/urandom of="$T/veh.bin" bs=4096 seek=$((0x1e00000/4096)) count=$(($1/4096)) status=none conv=notrunc
+  fi
+  fill_zero_runs "$T/veh.bin" "$AEP" "$((AEP + M2LD_SZ))"
+  "$LZ4" -l -9 -q -f "$T/veh.bin" "$T/veh.lz4"
+  wc -c < "$T/veh.lz4"
+}
+
+PAD=0
+KSZ=$(build_veh 0)
+while [ "$KSZ" -le 17000000 ]; do
+  PAD=$((PAD + 0x40000))
+  KSZ=$(build_veh "$PAD")
+done
+while [ "$KSZ" -le 17150000 ] && [ "$KSZ" -le $((VBMETA_OFF - 4096 - 0x8000)) ]; do
+  PAD=$((PAD + 0x8000))
+  KSZ=$(build_veh "$PAD")
+done
+echo "vehicle pad: $PAD bytes -> kernel $KSZ (size gate passed)"
 
 # ---- 4) lz4 legacy + splice into the AVB container ----
 "$LZ4" -l -9 -q -f "$T/veh.bin" "$T/veh.lz4"

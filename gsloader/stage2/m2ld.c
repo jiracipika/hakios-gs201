@@ -29,13 +29,15 @@ static size_t strlen(const char *s);
 
 /* ---- vehicle layout (offsets from image base; code itself at AEP) ---- */
 #define AEP_OFF        0x1d2a458u   /* stock PE entry RVA == our blob */
-#define GSPE_OFF       0x0200000u   /* GSPE manifest + raw Mach-O (~16.0 MiB) */
-#define PRAM_OFF       0x1180000u   /* XNU panic-log target, 512 KiB */
+#define GSPE_OFF       0x0800000u   /* GSPE manifest + raw Mach-O (~16.0 MiB) */
+#define PRAM_OFF       0x1b00000u   /* XNU panic-log target, 512 KiB */
 #define STACK_TOP_OFF  0x1c40000u
 #define IMG_SIZE       0x22e7a00u   /* stock PE SizeOfImage — vehicle length */
 
 /* ---- gs201 MMIO (identity under ABL's map) ---- */
-#define PLOG_BASE      0xfd3ff000ull
+#define PLOG_BASE      0xfd3ff000ull  /* ramoops console zone (2 MiB) */
+#define PMSG_BASE      0xfd5ff000ull  /* ramoops pmsg zone (2 MiB) — the
+                                         one whose pstore file TWRP exposes */
 #define PLOG_SIG       0x43474244u   /* "DBGC" */
 #define PLOG_CAP       (256u * 1024u)
 #define FB_BASE        0xfac00000ull
@@ -62,35 +64,73 @@ static size_t strlen(const char *s);
 #define XNU_WINDOW_TAIL 0x4400000ull          /* span + DT + boot_args + slack */
 
 /* =====================================================================
- * plog — ramoops console writer (survives the reset once cleaned)
+ * plog — ramoops writer, MIRRORED into both the console zone (0xfd3ff000,
+ * adopted by Android's kernel console) and the pmsg zone (0xfd5ff000 —
+ * readable from TWRP as pmsg-ramoops-0, the only zone it exposes). Writes
+ * a valid persistent_ram_buffer header so the next kernel ADOPTS the ring
+ * and appends after our text instead of overwriting it.
  * ===================================================================== */
-static volatile uint32_t *const pl_sig   = (volatile uint32_t *)(uintptr_t)PLOG_BASE;
-static volatile uint32_t *const pl_start = (volatile uint32_t *)(uintptr_t)(PLOG_BASE + 4);
-static volatile uint32_t *const pl_size  = (volatile uint32_t *)(uintptr_t)(PLOG_BASE + 8);
-static volatile uint8_t  *const pl_data  = (volatile uint8_t  *)(uintptr_t)(PLOG_BASE + 12);
+#define PROBE_SENT 0xa5a5deadbeef5a5aULL
+static uint64_t fault_count(void);              /* defined below */
+static uint64_t plog_zones[2] = { PLOG_BASE, PMSG_BASE };
+static int plog_nzones = 2;
 
 void m2ld_clean(uint64_t va, uint64_t len);
 
+/* probe both zones once; keep only the mapped+writable one(s) — a store to
+   unmapped device space can raise an async external abort (SError), and even
+   with skip-vectors that is a loop we do not want */
+static void plog_init(void)
+{
+    int n = 0;
+    uint64_t keep[2];
+    for (int z = 0; z < 2; z++) {
+        uint64_t a = (z ? PMSG_BASE : PLOG_BASE);
+        uint64_t c0 = fault_count();
+        uint64_t v = PROBE_SENT;
+        __asm__ volatile("ldr %0, [%1]" : "=r"(v) : "r"(a));
+        __asm__ volatile("" ::: "memory");
+        if (fault_count() != c0) continue;
+        keep[n++] = a;
+    }
+    plog_zones[0] = keep[0];
+    plog_zones[1] = keep[1];
+    plog_nzones = n;
+}
+
 static void plog_reset(void)
 {
-    *pl_sig = PLOG_SIG;
-    *pl_start = 0;
-    *pl_size = 0;
-    m2ld_clean(PLOG_BASE, 0x1000);
+    for (int z = 0; z < plog_nzones; z++) {
+        volatile uint32_t *b = (volatile uint32_t *)(uintptr_t)plog_zones[z];
+        b[0] = PLOG_SIG;      /* sig  */
+        b[1] = 0;             /* start */
+        b[2] = 0;             /* size  */
+    }
+    for (int z = 0; z < plog_nzones; z++)
+        m2ld_clean(plog_zones[z], 0x1000);
 }
 
 static void plog_sync(void)
 {
     __asm__ volatile("dsb sy" ::: "memory");
-    m2ld_clean(PLOG_BASE, 0x40000);
+    for (int z = 0; z < plog_nzones; z++)
+        m2ld_clean(plog_zones[z], 0x40000);
 }
 
 static void plog_add(const char *s, uint32_t n)
 {
-    uint32_t sz = *pl_size;
-    if (sz + n > PLOG_CAP) return;
-    for (uint32_t i = 0; i < n; i++) pl_data[sz + i] = (uint8_t)s[i];
-    *pl_size = sz + n;
+    for (int z = 0; z < plog_nzones; z++) {
+        volatile uint32_t *b = (volatile uint32_t *)(uintptr_t)plog_zones[z];
+        volatile uint8_t *d = (volatile uint8_t *)(uintptr_t)(plog_zones[z] + 12);
+        uint32_t st = b[1], sz = b[2];
+        if (sz + n > PLOG_CAP) continue;
+        /* append at data[start] and ADVANCE start: the kernel's writers take
+           the start field as their append position, so leaving it behind (as
+           v1-v3 did) made Android overwrite our head bytes immediately */
+        for (uint32_t i = 0; i < n; i++) d[st + i] = (uint8_t)s[i];
+        b[1] = st + n;
+        b[2] = sz + n;
+    }
 }
 
 static void plog_str(const char *s)
@@ -134,9 +174,16 @@ static inline uint64_t rd_tcr1(void) { uint64_t v; __asm__ volatile("mrs %0, tcr
 
 static void delay_ms(uint64_t ms, uint64_t frq)
 {
-    if (!frq) frq = 24576000ull;
-    uint64_t until = rd_cntpct() + ms * frq / 1000ull;
-    while ((int64_t)(until - rd_cntpct()) > 0) { }
+    (void)frq;
+    /* NO generic timer: CNTPCT is frozen/trapped in ABL's fastboot handoff
+       (v6 lesson: every timer-based wait hung and the run died on ABL's own
+       ~80 s watchdog). Calibrated iteration loop instead: ~0.5-1 s per 100M
+       simple iterations at the big cores' clocks. */
+    uint64_t rounds = ms / 20;             /* ~20 ms per round */
+    for (uint64_t r = 0; r <= rounds; r++) {
+        uint64_t n = 2000000ull;
+        __asm__ volatile("1: subs %0, %0, #1; b.ne 1b" : "+r"(n) :: "cc");
+    }
 }
 
 /* fault log written by the vectors in m2ld.S: [count][16 x {esr,elr,far,slot}] */
@@ -145,6 +192,26 @@ static uint64_t fault_count(void)
 {
     __asm__ volatile("dmb ish" ::: "memory");
     return *(volatile uint64_t *)(uintptr_t)m2_fault_log;
+}
+
+/* Ask EL3 to preset the post-reset boot mode to recovery (PMU SYSIP_DAT0 =
+ * 0xff). The direct EL1 write is filtered (v13 proved it ignored); an SMC
+ * through TF-A is the documented owner of that register. If the FID is
+ * unknown, EL3 just returns NOT_SUPPORTED in x0 — harmless to try. Landing
+ * the post-run reset in recovery keeps Android's logd from wrapping the
+ * ramoops rings, so the TWRP read is clean.
+ */
+static void preset_recovery_mode(void)
+{
+    uint64_t x0 = 0x82000504ull, x1 = 0xffull, x2 = 0;
+    __asm__ volatile("smc #0"
+                     : "+r"(x0), "+r"(x1), "+r"(x2)
+                     :
+                     : "x3", "x4", "x5", "x16", "x17", "memory");
+    plog_str("smc-recovery="); plog_hex(x0);
+    wr32(0x18060810ull, 0xffu);          /* belt and braces (usually ignored) */
+    plog_str("pmu-write done\n");
+    plog_sync();
 }
 
 static void plog_faults(const char *tag)
@@ -171,6 +238,7 @@ static void wdt_stop(uint64_t base)
 /* the silicon-proven instant window violation (fallback / error path) */
 static void wdt_arm_instant(uint64_t base)
 {
+    preset_recovery_mode();
     wr32(base + 0x04, WDT_KEY);
     wr32(base + 0x00, 0);
     wr32(base + 0x10, 0x100);
@@ -179,23 +247,23 @@ static void wdt_arm_instant(uint64_t base)
     __asm__ volatile("dsb sy" ::: "memory");
 }
 
-/* Count-only for 1 s on CL0's counter, derive the tick rate, then arm both
- * clusters for ~seconds. Returns the measured ticks/s (0 if unusable). */
+/* Count-only for ~1 s on CL0's counter, derive the tick rate, then arm both
+ * clusters. Returns measured ticks/s; falls back to the theoretical 46545 Hz
+ * (PCLK 24.576 MHz / (prescale 33 x DIV16 528)) if the measurement is off. */
 static uint64_t wdt_calibrate(void)
 {
-    uint64_t frq = rd_cntfrq();
     wdt_stop(WDT_CL0);
     wr32(WDT_CL0 + 0x10, 0x100);
     wr32(WDT_CL0 + 0x08, 0x400000);
     uint32_t back = rd32(WDT_CL0 + 0x08);
     wr32(WDT_CL0 + 0x00, WTCON_COUNT_ONLY);
     __asm__ volatile("dsb sy" ::: "memory");
-    delay_ms(1000, frq);
+    delay_ms(1000, 0);
     uint32_t now = rd32(WDT_CL0 + 0x08);
     wdt_stop(WDT_CL0);
     uint64_t delta = (uint64_t)0x400000 - (uint64_t)now;
     if (back != 0x400000) delta = 0;              /* WTCNT not 32-bit-writable */
-    if (delta < 1000 || delta > 50000000) delta = 0;
+    if (delta < 5000 || delta > 5000000) delta = 46545ull;
     return delta;
 }
 
@@ -210,6 +278,7 @@ static void wdt_arm_windowed(uint64_t base, uint64_t rate, uint64_t seconds)
     wr32(base + 0x08, (uint32_t)cnt);
     wr32(base + 0x00, WTCON_ARMED);
     __asm__ volatile("dsb sy" ::: "memory");
+    plog_str("wdt cnt="); plog_dec(cnt);
 }
 
 /* =====================================================================
@@ -542,6 +611,20 @@ _Static_assert(__builtin_offsetof(struct boot_args, bootFlags) == 720, "ba");
  * main
  * ===================================================================== */
 void m2ld_jump(uint64_t entry_pa, uint64_t args_pa);
+
+/* bisection ladder: build with -DM2LD_EXIT_AT=n to arm the instant wdt at
+   stage n (band ~30 s) instead of running on; 0 = full path */
+#ifndef M2LD_EXIT_AT
+#define M2LD_EXIT_AT 0
+#endif
+static void die_instant(void)
+{
+    wdt_arm_instant(WDT_CL0);
+    wdt_arm_instant(WDT_CL1);
+    for (;;) __asm__ volatile("wfe");
+}
+#define EXIT_AT(n) do { if (M2LD_EXIT_AT == (n)) { \
+    plog_str("exit-at " #n "\n"); plog_sync(); die_instant(); } } while (0)
 extern char m2ld_return_stub[];   /* asm; XNU's XNULDRST slot br's here */
 
 static uint64_t g_img_base, g_self, g_pb;
@@ -552,11 +635,16 @@ static uint64_t mem_top_for(uint64_t pb)
     return pb >= 0x800000000ull ? pb + 0x40000000ull : XNU_MEM_TOP;
 }
 
-/* pick a phys window: probe 2 MiB steps over [pb, pb+span); rw-check the ends */
+/* pick a phys window: probe 2 MiB steps over [pb, pb+span); rw-check the ends;
+ * never overlap the GSPE payload source (ramdisk region) */
+static uint64_t g_gspe_lo, g_gspe_hi;
+
 static int window_ok(uint64_t pb, uint64_t span)
 {
     if (pb & 0x1fffff) return 0;
     if (pb + span >= mem_top_for(pb)) return 0;
+    if (g_gspe_hi > g_gspe_lo &&
+        pb < g_gspe_hi && pb + span > g_gspe_lo) return 0;
     for (uint64_t a = pb; a < pb + span; a += 0x200000) {
         if (!try_map(a)) {
             plog_str("unmapped @"); plog_hex(a);
@@ -568,6 +656,105 @@ static int window_ok(uint64_t pb, uint64_t span)
     return 1;
 }
 
+/* GSPE discovery: 1) spliced in-image, 2) FDT /chosen initrd pointers,
+ * 3) DRAM scan for the magic (ramdisk delivery — the bare image ships the
+ * kernel stream stock-exact plus only the AEP patch, sidestepping ABL's
+ * modification-volume gate entirely). */
+static const struct gspe_hdr *gspe_check(uint64_t a)
+{
+    uint64_t c0 = fault_count();
+    uint32_t m0 = 0xa5a5a5a5u;
+    __asm__ volatile("ldr %w0, [%1]" : "=r"(m0) : "r"(a));
+    __asm__ volatile("" ::: "memory");
+    if (fault_count() != c0) return 0;
+    if (m0 != 0x45505347u) return 0;                 /* "GSPE" LE */
+    const struct gspe_hdr *h = (const struct gspe_hdr *)(uintptr_t)a;
+    if (h->kvb != KVB || h->nsegs == 0 || h->nsegs > 32 ||
+        h->kernel_size == 0 || h->kernel_size > 0x1200000u) return 0;
+    return h;
+}
+
+static const struct gspe_hdr *gspe_find(uint64_t dtb_pa)
+{
+    const struct gspe_hdr *h;
+
+    /* 1) in-image splice (AVB-container vehicles) */
+    h = gspe_check(g_img_base + GSPE_OFF);
+    if (h) { plog_str("gspe=in-image\n"); g_gspe_lo = g_img_base + GSPE_OFF; }
+
+    /* 2) FDT /chosen/linux,initrd-start + -end (ABL passes the DTB in x0) */
+    if (!h && dtb_pa) {
+        const uint8_t *b = (const uint8_t *)(uintptr_t)dtb_pa;
+        uint64_t c0 = fault_count();
+        uint32_t m = 0xa5a5a5a5u;
+        __asm__ volatile("ldr %w0, [%1]" : "=r"(m) : "r"(dtb_pa));
+        __asm__ volatile("" ::: "memory");
+        if (fault_count() == c0 && m == FDT_MAGIC) {
+            const uint8_t *st = b + ld32(b + 8), *strs = b + ld32(b + 20);
+            int depth = 0, in_chosen = 0;
+            const uint8_t *p = st;
+            uint64_t rd_start = 0, rd_end = 0;
+            for (;;) {
+                uint32_t tok = ld32(p); p += 4;
+                if (tok == FDT_NOP) continue;
+                if (tok == FDT_END) break;
+                if (tok == FDT_BEGIN_NODE) {
+                    const char *nm = (const char *)p;
+                    int len = 0; while (nm[len]) len++;
+                    p += len + 1; p = (const uint8_t *)((uintptr_t)(p + 3) & ~3ull);
+                    depth++;
+                    in_chosen = (depth == 2 && !__builtin_memcmp(nm, "chosen", 6));
+                } else if (tok == FDT_END_NODE) {
+                    if (depth == 2) in_chosen = 0;
+                    if (--depth <= 0) break;
+                } else if (tok == FDT_PROP && in_chosen) {
+                    uint32_t len = ld32(p), no = ld32(p + 4);
+                    const uint8_t *val = p + 8;
+                    p = (const uint8_t *)((uintptr_t)(p + 8 + len + 3) & ~3ull);
+                    const char *nm = (const char *)(strs + no);
+                    if (len == 8 && !__builtin_memcmp(nm, "linux,initrd-start", 18))
+                        rd_start = ((uint64_t)ld32(val) << 32) | ld32(val + 4);
+                    if (len == 8 && !__builtin_memcmp(nm, "linux,initrd-end", 16))
+                        rd_end = ((uint64_t)ld32(val) << 32) | ld32(val + 4);
+                    if (len == 4 && !__builtin_memcmp(nm, "linux,initrd-start", 18))
+                        rd_start = ld32(val);
+                    if (len == 4 && !__builtin_memcmp(nm, "linux,initrd-end", 16))
+                        rd_end = ld32(val);
+                } else if (tok == FDT_PROP) {
+                    uint32_t len = ld32(p);
+                    p = (const uint8_t *)((uintptr_t)(p + 8 + len + 3) & ~3ull);
+                }
+            }
+            plog_str("initrd="); plog_hex(rd_start);
+            plog_str("-"); plog_hex(rd_end);
+            if (rd_start && rd_end > rd_start) {
+                h = gspe_check(rd_start & ~0xfffull);
+                if (h) { plog_str("gspe=initrd\n"); }
+            }
+        }
+    }
+
+    /* 3) DRAM scan, 1 MiB steps: low bank above our image, then the high bank */
+    if (!h) {
+        for (uint64_t a = 0x82300000ull; a < 0x8f000000ull; a += 0x100000) {
+            h = gspe_check(a);
+            if (h) { plog_str("gspe=scan "); plog_hex(a); break; }
+        }
+    }
+    if (!h) {
+        for (uint64_t a = 0x880000000ull; a < 0x888000000ull; a += 0x100000) {
+            h = gspe_check(a);
+            if (h) { plog_str("gspe=scan-hi "); plog_hex(a); break; }
+        }
+    }
+    if (h) {
+        uint64_t body = 48ull + h->nsegs * 32ull + h->kernel_size;
+        g_gspe_lo = (uint64_t)(uintptr_t)h;
+        g_gspe_hi = g_gspe_lo + body;
+    }
+    return h;
+}
+
 void m2ld_main(uint64_t ax0, uint64_t ax1, uint64_t self, uint64_t mpidr,
                uint64_t el, uint64_t midr)
 {
@@ -575,7 +762,9 @@ void m2ld_main(uint64_t ax0, uint64_t ax1, uint64_t self, uint64_t mpidr,
     g_self = self;
     g_img_base = self - AEP_OFF;
 
+    plog_init();
     plog_reset();
+    EXIT_AT(1);
     plog_str("M2LD v1\n");
     plog_str("self=");      plog_hex(self);
     plog_str("imgbase=");   plog_hex(g_img_base);
@@ -589,17 +778,12 @@ void m2ld_main(uint64_t ax0, uint64_t ax1, uint64_t self, uint64_t mpidr,
     plog_sync();
     log_abl_regs(ax0, ax1);
     plog_faults("post-regs");
+    EXIT_AT(2);
 
-    /* ---- GSPE manifest ---- */
-    const struct gspe_hdr *h = (const struct gspe_hdr *)(uintptr_t)(g_img_base + GSPE_OFF);
-    if (__builtin_memcmp(h->magic, "GSPE01", 6) != 0) {
+    /* ---- GSPE manifest (in-image splice, FDT initrd, or DRAM scan) ---- */
+    const struct gspe_hdr *h = gspe_find(ax0);
+    if (!h) {
         plog_str("err B1 no-gspe\n"); plog_sync();
-        wdt_arm_instant(WDT_CL0); wdt_arm_instant(WDT_CL1);
-        for (;;) __asm__ volatile("wfe");
-    }
-    if (h->kvb != KVB || h->nsegs == 0 || h->nsegs > 32 ||
-        h->kernel_size == 0 || h->kernel_size > 0x1200000u) {
-        plog_str("err B2 bad-manifest\n"); plog_sync();
         wdt_arm_instant(WDT_CL0); wdt_arm_instant(WDT_CL1);
         for (;;) __asm__ volatile("wfe");
     }
@@ -618,6 +802,7 @@ void m2ld_main(uint64_t ax0, uint64_t ax1, uint64_t self, uint64_t mpidr,
     plog_str(" vmlo=");      plog_hex(vm_lo);
     plog_str(" vmhi=");      plog_hex(vm_hi);
     plog_sync();
+    EXIT_AT(3);
     if (h->entry_va < vm_lo || h->entry_va >= vm_hi) {
         plog_str("err B4 entry-outside\n"); plog_sync();
         wdt_arm_instant(WDT_CL0); wdt_arm_instant(WDT_CL1);
@@ -627,9 +812,10 @@ void m2ld_main(uint64_t ax0, uint64_t ax1, uint64_t self, uint64_t mpidr,
     /* ---- XNU phys window (ladder; everything is probed, nothing assumed) ---- */
     uint64_t span = (vm_hi - KVB) + 0x200000;   /* kernel + DT + args + slack */
     uint64_t pb0 = (g_img_base + IMG_SIZE + 0x1fffffull) & ~0x1fffffull;
-    uint64_t cands[4] = { pb0, pb0 + 0x4000000ull, pb0 + 0x10000000ull, 0x880000000ull };
+    /* (no +0x10000000 step: 0x90200000..0x98800000 is GSA/TPU/AoC/GXP rmem) */
+    uint64_t cands[3] = { pb0, pb0 + 0x4000000ull, 0x880000000ull };
     uint64_t pb = 0;
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < 3; i++) {
         plog_str("try pb="); plog_hex(cands[i]); plog_sync();
         if (window_ok(cands[i], span)) { pb = cands[i]; break; }
     }
@@ -645,6 +831,7 @@ void m2ld_main(uint64_t ax0, uint64_t ax1, uint64_t self, uint64_t mpidr,
     plog_str("span="); plog_hex(span);
     plog_str("memsize="); plog_hex(memsize);
     plog_sync();
+    EXIT_AT(4);
 
     /* ---- copy segments (memset vmsize, memcpy filesize) ---- */
     for (uint32_t i = 0; i < h->nsegs; i++) {
@@ -662,6 +849,7 @@ void m2ld_main(uint64_t ax0, uint64_t ax1, uint64_t self, uint64_t mpidr,
     }
     plog_faults("post-copy");
     plog_sync();
+    EXIT_AT(5);
 
     /* verify the first 8 bytes of __TEXT actually landed (MH magic there) */
     {
@@ -714,7 +902,9 @@ void m2ld_main(uint64_t ax0, uint64_t ax1, uint64_t self, uint64_t mpidr,
     m2ld_clean(pram_pa, 0x80000);
     m2ld_clean(g_img_base + PRAM_OFF - 0x80000, STACK_TOP_OFF - PRAM_OFF + 0x80000);
     m2ld_clean(PLOG_BASE, 0x40000);
+    m2ld_clean(PMSG_BASE, 0x40000);
     plog_faults("post-clean");
+    EXIT_AT(6);
 
     /* ---- XNULDRST: register our return stub so an early exception or a
      * checkpoint in the kernel jumps back to m2ld_return_stub (with the MMU
@@ -723,7 +913,8 @@ void m2ld_main(uint64_t ax0, uint64_t ax1, uint64_t self, uint64_t mpidr,
         volatile uint64_t *slot = (volatile uint64_t *)(uintptr_t)(h->stub_slot_va + slide);
         if (slot[0] == 0x545352444c554e58ULL) {     /* "XNULDRST" */
             slot[1] = (uint64_t)(uintptr_t)m2ld_return_stub;
-            slot[2] = 0;                            /* checkpoint: disabled */
+            slot[2] = 1;                            /* return at checkpoint 1:
+                                                       band ~55-65 s = XNU ran */
             slot[3] = slide;
             __asm__ volatile("dsb sy" ::: "memory");
             m2ld_clean((uint64_t)slot, 64);
@@ -741,6 +932,7 @@ void m2ld_main(uint64_t ax0, uint64_t ax1, uint64_t self, uint64_t mpidr,
     {
         uint64_t rate = wdt_calibrate();
         plog_str("wdt-rate="); plog_dec(rate); plog_sync();
+        preset_recovery_mode();            /* post-run reset -> recovery */
         if (rate >= 1000) {
             wdt_arm_windowed(WDT_CL0, rate, 45);
             wdt_arm_windowed(WDT_CL1, rate, 45);
@@ -751,6 +943,7 @@ void m2ld_main(uint64_t ax0, uint64_t ax1, uint64_t self, uint64_t mpidr,
         }
         plog_sync();
     }
+    EXIT_AT(7);
 
     plog_str("JUMP\n"); plog_sync();
     m2ld_jump(h->entry_va + slide, ba_pa);
