@@ -14,10 +14,15 @@
 
 .section .text.boot
 _start:
-    /* Linux ARM64 Image header (64 bytes) */
+    /* Linux ARM64 Image header (64 bytes). text_offset MUST be 0: the STOCK
+       Pixel 7 kernel carries text_offset=0 (entered at image start); our
+       0x80000 (the mtkloader/chainboot convention) made ABL enter
+       load_base+0x80000 — 512KB past this 6KB blob, in zero-filled RAM. Four
+       silicon runs (M0 + payload v1/v2/v3 + the v4 feed probe) died there
+       identically: 104s ABL-watchdog comeback, zero instructions executed. */
     b       primary_entry       /* code0 */
     .word   0                   /* code1 = exec below if entered as raw */
-    .quad   0x80000             /* text_offset */
+    .quad   0                   /* text_offset = 0, matching the stock kernel */
     .quad   0x02000000          /* image_size (covering; patched by mkboot if needed) */
     .quad   0x0a                /* flags 0x0a: LE (bit0=0), 4K pages (bits1-2=01), anywhere (bit3) */
     .quad   0                   /* res2 (0x20) */
@@ -28,32 +33,6 @@ _start:
 
 primary_entry:
     msr     daifset, #0xf
-    /* v4 EXECUTION PROBE (2026-11-06): three payload versions produced byte-
-       identical outcomes (104s wdt comeback) — nothing our code did ever
-       changed the timeline, so "ABL enters our code" is unproven. This probe
-       feeds BOTH cluster watchdogs (WTCNT := WTDAT, config-agnostic canonical
-       feed) ~400 rounds (~3-5 min), then parks. If ABL's armed watchdog is
-       one of these blocks, the comeback moves from ~104s to ~5-8 min = our
-       instructions execute and MMIO writes land. 104s again = code never
-       runs (or dies on the first MMIO access). No VBAR, no stack, no C. */
-    movz    x22, #0x4000
-    movk    x22, #0x200c, lsl #16       /* cl0 */
-    movz    x23, #0x5000
-    movk    x23, #0x200c, lsl #16       /* cl1 */
-    mov     w20, #400
-9:  ldr     w1, [x22, #4]               /* WTDAT */
-    str     w1, [x22, #8]               /* WTCNT := WTDAT (feed) */
-    ldr     w1, [x23, #4]
-    str     w1, [x23, #8]
-    movz    x21, #0xe100
-    movk    x21, #0x5f5, lsl #16
-8:  subs    x21, x21, #1
-    b.ne    8b
-    subs    w20, w20, #1
-    b.ne    9b
-    wfe
-10: b       10b                          /* park: fed wdt fires within one period */
-
     mov     x19, x0                     /* device tree pointer from ABL */
 
     mrs     x1, CurrentEL
@@ -66,12 +45,19 @@ primary_entry:
     b       20f
 10: msr     vbar_el1, x2
 20:
-    /* stack just below the load address, BSS cleared */
+    /* stack just below the load address, BSS cleared.
+       Everything here must be PC-relative: ABL picks the load base ("anywhere"
+       flag), so =symbol literal loads (absolute link-time addresses) would
+       clear/write the WRONG physical memory — and under ABL's live page tables
+       an unmapped write faults straight into park. adrp+add resolves at
+       runtime from PC. */
     adr     x0, _start
     sub     x0, x0, #0x8000
     mov     sp, x0
-    ldr     x0, =__bss_start
-    ldr     x1, =__bss_end
+    adrp    x0, __bss_start
+    add     x0, x0, :lo12:__bss_start
+    adrp    x1, __bss_end
+    add     x1, x1, :lo12:__bss_end
 1:  cmp     x0, x1
     b.ge    2f
     str     wzr, [x0], #4     /* word stride: never writes past __bss_end (an appended
