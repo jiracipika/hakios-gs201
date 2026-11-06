@@ -27,6 +27,69 @@ struct fdt_header { uint32_t magic, totalsize, off_dt_struct, off_dt_strings, of
 #define XNUP_MAGIC 0x584e5550u   /* ASCII "XNUP" bytes as ld32 (big-endian) reads them;
                                      the mtkloader reference native-reads the same bytes */
 
+/* ---- plog: gs201 ramoops console writer (v9 debug channel).
+   Zone at 0xfd3ff000 (gs201-rmem.dtsi ramoops_mem: console-size 0x200000 first,
+   then pmsg 0x200000; no dmesg records, no ECC). Format per fs/pstore/ram_core.c:
+   struct persistent_ram_buffer { u32 sig; u32 start; u32 size; u8 data[] } with
+   sig = PERSISTENT_RAM_SIG (0x43474244, "DBGC") — the console zone is inited
+   with sig arg 0, which the driver XORs with the constant. After our reset,
+   Android exposes the zone as /sys/fs/pstore/console-ramoops-0 — readable from
+   a recovery root shell. Every gsloader decision lands in the log, so a run is
+   never blind again. Same physical-write assumption as the watchdog: if ABL
+   hands us a MMU whose map excludes this DRAM, the write faults and the run
+   looks exactly like today's 104s park (a diagnosable outcome too). */
+#define PLOG_BASE 0xfd3ff000ull
+#define PLOG_SIG  0x43474244u
+#define PLOG_CAP  (1024u * 1024u)   /* stay well inside the 2MB console zone */
+
+static volatile uint32_t *const pl_sig   = (volatile uint32_t *)(uintptr_t)PLOG_BASE;
+static volatile uint32_t *const pl_start = (volatile uint32_t *)(uintptr_t)(PLOG_BASE + 4);
+static volatile uint32_t *const pl_size  = (volatile uint32_t *)(uintptr_t)(PLOG_BASE + 8);
+static volatile uint8_t  *const pl_data  = (volatile uint8_t  *)(uintptr_t)(PLOG_BASE + 12);
+
+static void plog_reset(void)
+{
+    *pl_sig = PLOG_SIG;
+    *pl_start = 0;
+    *pl_size = 0;
+}
+
+static void plog_add(const char *s, uint32_t n)
+{
+    uint32_t sz = *pl_size;
+    if (sz + n > PLOG_CAP) return;
+    for (uint32_t i = 0; i < n; i++) pl_data[sz + i] = (uint8_t)s[i];
+    *pl_size = sz + n;
+}
+
+static void plog_str(const char *s)
+{
+    uint32_t n = 0;
+    while (s[n]) n++;
+    plog_add(s, n);
+}
+
+static void plog_hex(uint64_t v)
+{
+    char t[19] = "0x";
+    for (int i = 0; i < 16; i++) {
+        int d = (int)((v >> ((15 - i) * 4)) & 0xf);
+        t[2 + i] = (char)(d < 10 ? '0' + d : 'a' + d - 10);
+    }
+    t[18] = '\n';
+    plog_add(t, 19);
+}
+
+static void plog_dec(uint64_t v)
+{
+    char t[21];
+    int i = 20;
+    t[i] = 0;
+    do { t[--i] = (char)('0' + v % 10); v /= 10; } while (v);
+    plog_add(&t[i], (uint32_t)(20 - i));
+    plog_add("\n", 1);
+}
+
 static uint32_t ld32(const void *p) { uint32_t v; __builtin_memcpy(&v, p, 4); return __builtin_bswap32(v); }
 
 struct walker { const uint8_t *st; const uint8_t *str; };
@@ -125,7 +188,15 @@ void gsloader_main(uint64_t dtb)
 {
     struct fdt_header h;
     const uint8_t *b = (const uint8_t *)dtb;
-    if (ld32(b) != FDT_MAGIC) gsloader_reset(0, 0xF0);            /* no DTB from ABL */
+
+    plog_reset();
+    plog_str("gsloader v9 enter\n");
+    plog_str("dtb="); plog_hex(dtb);
+
+    if (ld32(b) != FDT_MAGIC) {                                   /* no DTB from ABL */
+        plog_str("err F0 bad-dtb-magic\n");
+        gsloader_reset(0, 0xF0);
+    }
     __builtin_memcpy(&h, b, sizeof h);
     struct walker w = { b + ld32(&h.off_dt_struct), b + ld32(&h.off_dt_strings) };
 
@@ -133,19 +204,42 @@ void gsloader_main(uint64_t dtb)
     int ac = 2, sc = 2, psci_hvc = -1;                          /* -1: unknown */
     walk_tree(&w, &bk, &ac, &sc, &psci_hvc);
 
-    if (bk.n == 0) gsloader_reset(0, 0xF1);                       /* no /memory parsed */
-    if (bk.size[0] < (64ull << 20)) gsloader_reset(0, 0xF2);      /* bank looks wrong */
+    plog_str("banks="); plog_dec((uint64_t)bk.n);
+    plog_str(" bank0="); plog_hex(bk.base[0]);
+    plog_str(" size0="); plog_hex(bk.size[0]);
+    plog_str(" psci="); plog_dec((uint64_t)(psci_hvc + 1));
+
+    if (bk.n == 0) {                                              /* no /memory parsed */
+        plog_str("err F1 no-memory\n");
+        gsloader_reset(0, 0xF1);
+    }
+    if (bk.size[0] < (64ull << 20)) {                             /* bank looks wrong */
+        plog_str("err F2 bank-too-small\n");
+        gsloader_reset(0, 0xF2);
+    }
 
     const uint8_t *x = xnup_find((uintptr_t)_start, &bk);
-    if (!x)
-        gsloader_reset(psci_hvc < 0 ? 0 : (uint64_t)psci_hvc, 0xB1u);  /* no payload: heartbeat image */
+    if (!x) {
+        plog_str("err B1 no-payload\n");
+        gsloader_reset(psci_hvc < 0 ? 0 : (uint64_t)psci_hvc, 0xB1u);
+    }
 
     /* payload present: find the kernel entry, check its arm64 Image header, jump.
        The payload inherits ABL's state (MMU/caches off) and gets x0 = DTB. */
     const uint8_t *k = xnup_kernel(x);
-    if (!k) gsloader_reset(0, 0xB3u);                             /* XNUP but no kernel entry */
-    if (__builtin_memcmp(k + 0x38, "ARM\x64", 4)) gsloader_reset(0, 0xB4u);  /* not an arm64 Image */
+    if (!k) {                                                     /* XNUP but no kernel entry */
+        plog_str("err B3 no-kernel-entry\n");
+        gsloader_reset(0, 0xB3u);
+    }
+    if (__builtin_memcmp(k + 0x38, "ARM\x64", 4)) {               /* not an arm64 Image */
+        plog_str("err B4 not-arm64-image\n");
+        gsloader_reset(0, 0xB4u);
+    }
+    plog_str("xnup="); plog_hex((uint64_t)(uintptr_t)x);
+    plog_str(" jump="); plog_hex((uint64_t)(uintptr_t)k);
+    plog_str("jumping\n");
     gsloader_jump((uintptr_t)k, dtb);
+    plog_str("err B5 jump-returned\n");
     gsloader_reset(0, 0xB5u);                                     /* jump returned?! */
 }
 
