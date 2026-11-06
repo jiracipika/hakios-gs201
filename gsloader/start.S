@@ -28,6 +28,32 @@ _start:
 
 primary_entry:
     msr     daifset, #0xf
+    /* v4 EXECUTION PROBE (2026-11-06): three payload versions produced byte-
+       identical outcomes (104s wdt comeback) — nothing our code did ever
+       changed the timeline, so "ABL enters our code" is unproven. This probe
+       feeds BOTH cluster watchdogs (WTCNT := WTDAT, config-agnostic canonical
+       feed) ~400 rounds (~3-5 min), then parks. If ABL's armed watchdog is
+       one of these blocks, the comeback moves from ~104s to ~5-8 min = our
+       instructions execute and MMIO writes land. 104s again = code never
+       runs (or dies on the first MMIO access). No VBAR, no stack, no C. */
+    movz    x22, #0x4000
+    movk    x22, #0x200c, lsl #16       /* cl0 */
+    movz    x23, #0x5000
+    movk    x23, #0x200c, lsl #16       /* cl1 */
+    mov     w20, #400
+9:  ldr     w1, [x22, #4]               /* WTDAT */
+    str     w1, [x22, #8]               /* WTCNT := WTDAT (feed) */
+    ldr     w1, [x23, #4]
+    str     w1, [x23, #8]
+    movz    x21, #0xe100
+    movk    x21, #0x5f5, lsl #16
+8:  subs    x21, x21, #1
+    b.ne    8b
+    subs    w20, w20, #1
+    b.ne    9b
+    wfe
+10: b       10b                          /* park: fed wdt fires within one period */
+
     mov     x19, x0                     /* device tree pointer from ABL */
 
     mrs     x1, CurrentEL
