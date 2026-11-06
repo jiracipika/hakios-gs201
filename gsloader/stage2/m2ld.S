@@ -159,34 +159,34 @@ m2ld_return_stub:
        returned through the slot. */
     cmp     x2, #2
     b.ne    8f
-    movz    w15, #0x3000
-    movk    w15, #0x000e, lsl #16        /* WTCNT = 0xE3000 ~= 20 s */
+    movz    w15, #0x3a98                 /* 750 Hz x 20 s (16-bit WTCNT) */
     b       9f
-8:  mov     w15, #0x80                   /* instant window violation */
-9:  movz    x13, #0x4000
-    movk    x13, #0x200c, lsl #16        /* WDT_CL0 */
-    movz    w14, #0xffee
-    movk    w14, #0xc0, lsl #16          /* 0xc0ffee KEY */
-    str     w14, [x13, #4]
-    str     wzr, [x13]
-    mov     w14, #0x100
-    str     w14, [x13, #16]              /* WTMINCNT */
+8:  mov     w15, #0x80                   /* ~instant timeout */
+9:  movz    x13, #0x0000
+    movk    x13, #0x1006, lsl #16        /* WDT_CL0 @ 0x10060000 */
+    bl      stub_arm
+    movz    x13, #0x0000
+    movk    x13, #0x1007, lsl #16        /* WDT_CL1 @ 0x10070000 */
+    bl      stub_arm
+    b       19f
+/* stub_arm: x13 = wdt base, w15 = count; kernel-style start sequence */
+stub_arm:
+    ldr     w14, [x13]
+    bic     w14, w14, #0x1               /* ~RSTEN */
+    bic     w14, w14, #0x20              /* ~ENABLE -> stop */
+    str     w14, [x13]
+    str     w15, [x13, #4]               /* WTDAT = reload */
     str     w15, [x13, #8]               /* WTCNT */
-    movz    w14, #0x2021
-    movk    w14, #0x10, lsl #16
-    str     w14, [x13]
-    movz    x13, #0x5000
-    movk    x13, #0x200c, lsl #16        /* WDT_CL1 */
-    movz    w14, #0xffee
-    movk    w14, #0xc0, lsl #16
-    str     w14, [x13, #4]
-    str     wzr, [x13]
-    mov     w14, #0x100
-    str     w14, [x13, #16]
-    str     w15, [x13, #8]
-    movz    w14, #0x2021
-    movk    w14, #0x10, lsl #16
-    str     w14, [x13]
+    cmp     w15, #0x80
+    b.ls    15f                          /* instant: no prescale needed */
+    movz    w14, #0xff39
+    movk    w14, #0x10, lsl #16          /* DBGACK|PRE255|DIV128|EN|RST */
+    b       16f
+15: movz    w14, #0x0039
+    movk    w14, #0x10, lsl #16          /* DBGACK|DIV128|EN|RST */
+16: str     w14, [x13]
+    ret
+19:
     /* clean the record + plog head so they survive the reset */
     add     x12, x10, #0x7c0
     add     x15, x10, #0x900

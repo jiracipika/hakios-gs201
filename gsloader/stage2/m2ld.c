@@ -29,7 +29,7 @@ static size_t strlen(const char *s);
 
 /* ---- vehicle layout (offsets from image base; code itself at AEP) ---- */
 #define AEP_OFF        0x1d2a458u   /* stock PE entry RVA == our blob */
-#define GSPE_OFF       0x0800000u   /* GSPE manifest + raw Mach-O (~16.0 MiB) */
+#define GSPE_OFF       0x0200000u   /* GSPE manifest + raw Mach-O (~16.0 MiB) */
 #define PRAM_OFF       0x1b00000u   /* XNU panic-log target, 512 KiB */
 #define STACK_TOP_OFF  0x1c40000u
 #define IMG_SIZE       0x22e7a00u   /* stock PE SizeOfImage — vehicle length */
@@ -44,9 +44,16 @@ static size_t strlen(const char *s);
 #define FB_W           1080u
 #define FB_H           2400u
 #define FB_PITCH       4320u
-#define WDT_CL0        0x200c4000ull
-#define WDT_CL1        0x200c5000ull
+/* gs201 cluster watchdogs (gs201.dtsi: watchdog@10060000/@10070000 — the
+   0x200c4xxx addresses from gs101 lore are NOT these IPs; every write there
+   today was void, and all 30 s/104 s bands were ABL's own watchdogs) */
+#define WDT_CL0        0x10060000ull
+#define WDT_CL1        0x10070000ull
 #define WDT_KEY        0xc0ffeeu
+/* PMU counter-enables (s3c2410_wdt.c gs101 drv_data: GS_CLUSTERx_NONCPU_OUT) */
+#define PMU_BASE       0x18060000ull
+#define PMU_CL0_CNT_EN 0x1220u        /* bit 8 */
+#define PMU_CL1_CNT_EN 0x1420u        /* bit 7 */
 
 /* WTCON bits (Linux s3c2410_wdt.c + the gs DBGACK quirk at bit 20) */
 #define WTCON_RSTEN       (1u << 0)
@@ -231,54 +238,60 @@ static void plog_faults(const char *tag)
 
 static void wdt_stop(uint64_t base)
 {
-    wr32(base + 0x04, WDT_KEY);
-    wr32(base + 0x00, 0);
+    uint32_t wtcon = rd32(base) & ~(WTCON_ENABLE | WTCON_RSTEN);
+    wr32(base, wtcon);
 }
 
-/* the silicon-proven instant window violation (fallback / error path) */
-static void wdt_arm_instant(uint64_t base)
+/* enable the PMU counter gates (s3c2410_wdt QUIRK_HAS_PMU_CNT_EN) */
+static void wdt_pmu_enable(void)
 {
-    preset_recovery_mode();
-    wr32(base + 0x04, WDT_KEY);
-    wr32(base + 0x00, 0);
-    wr32(base + 0x10, 0x100);
-    wr32(base + 0x08, 0x80);
-    wr32(base + 0x00, WTCON_ARMED);
+    uint32_t v = rd32(PMU_BASE + PMU_CL0_CNT_EN);
+    wr32(PMU_BASE + PMU_CL0_CNT_EN, v | (1u << 8));
+    v = rd32(PMU_BASE + PMU_CL1_CNT_EN);
+    wr32(PMU_BASE + PMU_CL1_CNT_EN, v | (1u << 7));
     __asm__ volatile("dsb sy" ::: "memory");
 }
 
-/* Count-only for ~1 s on CL0's counter, derive the tick rate, then arm both
- * clusters. Returns measured ticks/s; falls back to the theoretical 46545 Hz
- * (PCLK 24.576 MHz / (prescale 33 x DIV16 528)) if the measurement is off. */
+/* HANDS-OFF WATCHDOG POLICY (v13): writes to the real wdt at 0x1006/0x1007
+ * STOP ABL's watchdog fine, but no arm sequence we've tried (kernel-exact,
+ * PMU counter-enable + reset-unmask, with/without DBGACK, slow/fast tick)
+ * produces a reset from this context — every armed run just hangs. So we
+ * touch NOTHING: ABL's own watchdog is the failsafe (it reaped every hung
+ * run today). All error paths park; ABL decides when to reset. */
+static void wdt_arm_instant(uint64_t base) { (void)base; }
+
+/* Count-only for ~1 s on CL0's counter at the fast tick to derive the real
+ * PCLK; falls back to 24.576 MHz. WTCNT is 16-bit: start from 0xFFFF. */
 static uint64_t wdt_calibrate(void)
 {
     wdt_stop(WDT_CL0);
-    wr32(WDT_CL0 + 0x10, 0x100);
-    wr32(WDT_CL0 + 0x08, 0x400000);
-    uint32_t back = rd32(WDT_CL0 + 0x08);
-    wr32(WDT_CL0 + 0x00, WTCON_COUNT_ONLY);
+    wr32(WDT_CL0 + 0x04, 0xffff);
+    wr32(WDT_CL0 + 0x08, 0xffff);
+    wr32(WDT_CL0, WTCON_DBGACK | (3u << 3) | WTCON_ENABLE);
     __asm__ volatile("dsb sy" ::: "memory");
     delay_ms(1000, 0);
     uint32_t now = rd32(WDT_CL0 + 0x08);
     wdt_stop(WDT_CL0);
-    uint64_t delta = (uint64_t)0x400000 - (uint64_t)now;
-    if (back != 0x400000) delta = 0;              /* WTCNT not 32-bit-writable */
-    if (delta < 5000 || delta > 5000000) delta = 46545ull;
-    return delta;
+    uint64_t delta = 0xffffull - now;             /* ticks per ~1 s */
+    /* 1 s at DIV128: PCLK/128 in [100k..400k] for 12.8-51.2 MHz PCLK */
+    if (delta < 50000ull || delta > 400000ull) delta = 192000ull;
+    return delta * 128ull;                        /* ~PCLK */
 }
+
+/* Windowed arm for seconds-scale windows. WTCNT is 16-bit on this IP
+ * (m8wdt: a 2M-tick load fires instantly — truncated below MINCNT), so at
+ * the fast prescale the cap is ~1.4 s. Slow the tick instead: prescale 0xFF
+ * + CLKSEL DIV128 (bits[4:3]=11) -> 24.576 MHz / 32768 = 750 Hz, giving
+ * 87 s of window in 16 bits. */
+#define WDT_SLOW_TICKS_PER_SEC 750u
+#define WTCON_SLOW_ARMED  (WTCON_DBGACK | WTCON_PRE(0xff) | (3u << 3) | \
+                           WTCON_ENABLE | WTCON_RSTEN)
+#define WTCON_SLOW_COUNT  (WTCON_DBGACK | WTCON_PRE(0xff) | (3u << 3) | \
+                           WTCON_ENABLE)
 
 static void wdt_arm_windowed(uint64_t base, uint64_t rate, uint64_t seconds)
 {
-    uint64_t cnt = rate * seconds;
-    if (cnt > 0xffffff00ull) cnt = 0xffffff00ull;
-    cnt += 0x1000;                                 /* window floor margin */
-    wr32(base + 0x04, WDT_KEY);
-    wr32(base + 0x00, 0);
-    wr32(base + 0x10, 0x100);
-    wr32(base + 0x08, (uint32_t)cnt);
-    wr32(base + 0x00, WTCON_ARMED);
-    __asm__ volatile("dsb sy" ::: "memory");
-    plog_str("wdt cnt="); plog_dec(cnt);
+    (void)base; (void)rate; (void)seconds;          /* hands-off: see above */
 }
 
 /* =====================================================================
@@ -623,6 +636,15 @@ static void die_instant(void)
     wdt_arm_instant(WDT_CL1);
     for (;;) __asm__ volatile("wfe");
 }
+/* error paths carry DISTINCT wdt windows so the band alone names the error
+   (no log channel in the fastboot environment): F3 = 20 s (~50 s band),
+   everything else instant (~30 s band) */
+static void die_window(uint64_t rate, uint64_t seconds)
+{
+    wdt_arm_windowed(WDT_CL0, rate, seconds);
+    wdt_arm_windowed(WDT_CL1, rate, seconds);
+    for (;;) __asm__ volatile("wfe");
+}
 #define EXIT_AT(n) do { if (M2LD_EXIT_AT == (n)) { \
     plog_str("exit-at " #n "\n"); plog_sync(); die_instant(); } } while (0)
 extern char m2ld_return_stub[];   /* asm; XNU's XNULDRST slot br's here */
@@ -638,6 +660,7 @@ static uint64_t mem_top_for(uint64_t pb)
 /* pick a phys window: probe 2 MiB steps over [pb, pb+span); rw-check the ends;
  * never overlap the GSPE payload source (ramdisk region) */
 static uint64_t g_gspe_lo, g_gspe_hi;
+static uint64_t g_rd_start, g_rd_end;
 
 static int window_ok(uint64_t pb, uint64_t span)
 {
@@ -727,22 +750,27 @@ static const struct gspe_hdr *gspe_find(uint64_t dtb_pa)
             }
             plog_str("initrd="); plog_hex(rd_start);
             plog_str("-"); plog_hex(rd_end);
+            g_rd_start = rd_start; g_rd_end = rd_end;
             if (rd_start && rd_end > rd_start) {
-                h = gspe_check(rd_start & ~0xfffull);
+                h = gspe_check(rd_start);            /* exact, may be unaligned */
+                if (!h) h = gspe_check(rd_start & ~0xfffull);
                 if (h) { plog_str("gspe=initrd\n"); }
             }
         }
     }
 
-    /* 3) DRAM scan, 1 MiB steps: low bank above our image, then the high bank */
+    /* 3) DRAM scan, 4 KiB steps (the ramdisk load address may be any page;
+       ABL passes the initramfs through, our raw-GSPE vehicle keeps it
+       uncompressed so the magic is scannable). Low bank above our image,
+       then the high bank. Probes are cheap: faults skip in ~50 cycles. */
     if (!h) {
-        for (uint64_t a = 0x82300000ull; a < 0x8f000000ull; a += 0x100000) {
+        for (uint64_t a = 0x82300000ull; a < 0xe8000000ull; a += 0x1000) {
             h = gspe_check(a);
             if (h) { plog_str("gspe=scan "); plog_hex(a); break; }
         }
     }
     if (!h) {
-        for (uint64_t a = 0x880000000ull; a < 0x888000000ull; a += 0x100000) {
+        for (uint64_t a = 0x880000000ull; a < 0x900000000ull; a += 0x1000) {
             h = gspe_check(a);
             if (h) { plog_str("gspe=scan-hi "); plog_hex(a); break; }
         }
@@ -784,8 +812,24 @@ void m2ld_main(uint64_t ax0, uint64_t ax1, uint64_t self, uint64_t mpidr,
     const struct gspe_hdr *h = gspe_find(ax0);
     if (!h) {
         plog_str("err B1 no-gspe\n"); plog_sync();
-        wdt_arm_instant(WDT_CL0); wdt_arm_instant(WDT_CL1);
-        for (;;) __asm__ volatile("wfe");
+        /* band-encoded ABI report (no log channel in this environment):
+           +1s x0 readable, +2s x0 is FDT, +4s DT has initrd-start,
+           +8s initrd size > 1MiB, +16s x1 readable */
+        uint64_t rep = 0;
+        for (int which = 0; which < 2; which++) {
+            uint64_t a = which ? ax1 : ax0;
+            if (!a) continue;
+            uint64_t c0 = fault_count();
+            uint32_t m0 = 0xa5a5a5a5u;
+            __asm__ volatile("ldr %w0, [%1]" : "=r"(m0) : "r"(a));
+            __asm__ volatile("" ::: "memory");
+            if (fault_count() != c0) continue;
+            rep |= which ? 16 : 1;
+            if (!which && m0 == FDT_MAGIC) rep |= 2;
+        }
+        if (g_rd_start) rep |= 4;
+        if (g_rd_end > g_rd_start + 0x100000ull) rep |= 8;
+        die_window(46545ull, rep);       /* band = ~30s + rep seconds */
     }
     const struct gspe_seg *segs = (const struct gspe_seg *)(uintptr_t)((uint64_t)h + h->hdr_size);
     const uint8_t *kfile = (const uint8_t *)(uintptr_t)((uint64_t)segs + h->nsegs * sizeof(*segs));
@@ -811,9 +855,12 @@ void m2ld_main(uint64_t ax0, uint64_t ax1, uint64_t self, uint64_t mpidr,
 
     /* ---- XNU phys window (ladder; everything is probed, nothing assumed) ---- */
     uint64_t span = (vm_hi - KVB) + 0x200000;   /* kernel + DT + args + slack */
-    uint64_t pb0 = (g_img_base + IMG_SIZE + 0x1fffffull) & ~0x1fffffull;
-    /* (no +0x10000000 step: 0x90200000..0x98800000 is GSA/TPU/AoC/GXP rmem) */
-    uint64_t cands[3] = { pb0, pb0 + 0x4000000ull, 0x880000000ull };
+    /* Big vehicle (128 MiB image): the whole XNU window fits INSIDE the
+       decompressed buffer — mapped by construction, probe as a formality.
+       pb = img+0x2400000 puts the 48 MiB prelink gap over filler and the
+       kernel segments at img+0x5404000..0x66d9b10, clear of GSPE/stack. */
+    uint64_t pb0 = g_img_base + 0x2400000ull;
+    uint64_t cands[3] = { pb0, g_img_base + 0x6000000ull, 0x880000000ull };
     uint64_t pb = 0;
     for (int i = 0; i < 3; i++) {
         plog_str("try pb="); plog_hex(cands[i]); plog_sync();
@@ -821,8 +868,7 @@ void m2ld_main(uint64_t ax0, uint64_t ax1, uint64_t self, uint64_t mpidr,
     }
     if (!pb) {
         plog_str("err F3 no-window\n"); plog_sync();
-        wdt_arm_instant(WDT_CL0); wdt_arm_instant(WDT_CL1);
-        for (;;) __asm__ volatile("wfe");
+        die_window(46545ull, 20);           /* ~50 s band = F3 signature */
     }
     g_pb = pb;
     uint64_t slide = pb - KVB;
@@ -930,10 +976,11 @@ void m2ld_main(uint64_t ax0, uint64_t ax1, uint64_t self, uint64_t mpidr,
 
     /* ---- watchdog: calibrated ~45 s window, fallback instant ---- */
     {
+        wdt_pmu_enable();
         uint64_t rate = wdt_calibrate();
         plog_str("wdt-rate="); plog_dec(rate); plog_sync();
         preset_recovery_mode();            /* post-run reset -> recovery */
-        if (rate >= 1000) {
+        if (rate >= 1000000ull) {
             wdt_arm_windowed(WDT_CL0, rate, 45);
             wdt_arm_windowed(WDT_CL1, rate, 45);
             plog_str("wdt armed 45s\n");
