@@ -1,27 +1,22 @@
 /*
- * stage2 — the M1 payload proof (Pixel 7 / gs201), v3.
+ * stage2 — the M1 payload proof (Pixel 7 / gs201), v4 (KEY protocol).
  *
- * Silicon evidence so far (2026-11-06 night):
- *  - ABL runs the loader (M0: loader DTB-parse + reset attempt).
- *  - PSCI SYSTEM_RESET silently no-ops from the ABL fastboot-boot context
- *    (SMC and HVC both return without effect).
- *  - v2 armed BOTH cluster watchdogs with the kernel emergency-restart recipe
- *    (s3c2410wdt_restart, gs s3c2410_wdt.c) — and the outcome was identical to
- *    loader-only (104s comeback, bootreason watchdog,apc,early). Since v2's
- *    first write CLEARS WTCON (which would have disarmed ABL's watchdog and
- *    parked the phone forever), yet ABL's watchdog still fired on schedule,
- *    the writes never took effect: front-runner hypothesis = ABL hands off
- *    with the MMU ON (start.S's "MMU off at handoff" was an assumption), our
- *    wdt MMIO write faults -> gsloader_trap -> PSCI-park -> ABL watchdog fires
- *    untouched.
+ * Silicon evidence (2026-11-06 night): six runs with byte-identical outcomes
+ * (104s ABL-watchdog comeback, bootreason watchdog,apc,early) across PSCI /
+ * delay+arm / MMU-off+arm payload variants — our wdt writes were silently
+ * ignored every time. Root cause found in the ABL binary + vendor_boot DTB:
+ * the gs201 cluster watchdog blocks are KEY-LOCKED. KEY register at block
+ * base +0x04: write 0xc0ffee to unlock, 0x0 to lock. The kernel's
+ * s3c2410wdt_restart recipe writes WTDAT at +0x04 — i.e. a garbage key to a
+ * locked block — so its arm never took effect. v4 unlocks first (see
+ * arm_wdt below), then arms the instant windowed violation.
  *
- * v3: turn the MMU off OURSELVES first (EL2 sctlr only if CurrentEL==EL2;
- * EL1 sctlr always), invalidate icache, then arm both cluster watchdogs for
- * the instant windowed violation -> hard reset in milliseconds.
+ * MMU/caches are still turned off by our own hand first (EL2-aware).
  *
- * GREEN = adb back in ~45-55s (reset ~0s after payload entry). 104s again =
- * the payload branch never reaches the wdt writes (jump-path bug in the
- * loader — next suspect is xnup_find/xnup_kernel offset math).
+ * GREEN = adb back in ~45-55s (reset in ~ms after payload entry).
+ * 104s again = the payload branch still never reaches the writes (entry/jump
+ * path bug — then the next diagnostic is ABL's own bl_old_log, readable from
+ * a root shell at 0xfd880000).
  */
 .section .text.boot
 .global _start
@@ -72,12 +67,27 @@ entry:
     b       3b                       /* reset asserts in ~ms; park as fallback */
 
 /*
- * arm_wdt — s3c2410wdt_restart() register recipe for one cluster block.
- * x0 = block base. Offsets: WTCON 0x00, WTDAT 0x04, WTCNT 0x08, WTMINCNT 0x10.
- * WTCON value: ENABLE(bit5) | RSTEN(bit0) | DIV16(0<<3) | PRESCALE(0x20)<<8 |
- *              WINDOWED(bit20) = 0x102021 — identical to the kernel's restart.
+ * arm_wdt — gs201 cluster-watchdog arm for one block, with the KEY protocol.
+ * x0 = block base (cl0 0x200c4000, cl1 0x200c5000).
+ *
+ * ABL binary disassembly (bootloader-rango, Thumb fn @0xf90ffc): KEY register
+ * lives at block base +0x04 — write 0xc0ffee to UNLOCK, 0x0 to LOCK — and the
+ * ABL descriptor tables carry {0x200c4000/-1/0xc0ffee} and {0x200c5000/-1/
+ * 0xc0ffee}. The vendor_boot DTB says the same: watchdog_cl0/cl1 have
+ * key-unlock=<0xc0ffee>, key-lock=<0x0>. On gs201 the +0x04 slot REPLACES the
+ * classic s3c WTDAT — which means the kernel's s3c2410wdt_restart recipe
+ * (WTDAT write at +0x04) writes a garbage key to a locked block and every
+ * subsequent write is silently ignored. That is exactly what v2/v3/v6 did.
+ * WTDAT is therefore skipped entirely: the instant windowed violation comes
+ * from WTMINCNT (0x100) > WTCNT (0x80), which needs no WTDAT.
+ *
+ * WTCON value: ENABLE(bit5) | RSTEN(bit0) | DIV16 | PRESCALE(0x20)<<8 |
+ *              WINDOWED(bit20) = 0x102021.
  */
 arm_wdt:
+    movz    w1, #0xffee
+    movk    w1, #0xc0, lsl #16       /* w1 = 0x00c0ffee */
+    str     w1, [x0, #0x04]          /* KEY = unlock */
     mov     w1, #0
     str     w1, [x0]                 /* WTCON = 0 (disable, clear inherited arm) */
     mov     w1, #0x100
@@ -85,7 +95,6 @@ arm_wdt:
                                         windowed violation = reset in ~ms */
     mov     w1, #0x80
     str     w1, [x0, #0x08]          /* WTCNT = 0x80 */
-    str     w1, [x0, #0x04]          /* WTDAT = 0x80 */
     movz    w1, #0x2021
     movk    w1, #0x10, lsl #16       /* w1 = 0x00102021 */
     str     w1, [x0]                 /* WTCON = the violation arm */

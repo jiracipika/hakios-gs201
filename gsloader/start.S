@@ -14,22 +14,25 @@
 
 .section .text.boot
 _start:
-    /* Linux ARM64 Image header (64 bytes). text_offset MUST be 0: the STOCK
-       Pixel 7 kernel carries text_offset=0 (entered at image start); our
-       0x80000 (the mtkloader/chainboot convention) made ABL enter
-       load_base+0x80000 — 512KB past this 6KB blob, in zero-filled RAM. Four
-       silicon runs (M0 + payload v1/v2/v3 + the v4 feed probe) died there
-       identically: 104s ABL-watchdog comeback, zero instructions executed. */
-    b       primary_entry       /* code0 */
-    .word   0                   /* code1 = exec below if entered as raw */
-    .quad   0                   /* text_offset = 0, matching the stock kernel */
-    .quad   0x02000000          /* image_size (covering; patched by mkboot if needed) */
-    .quad   0x0a                /* flags 0x0a: LE (bit0=0), 4K pages (bits1-2=01), anywhere (bit3) */
-    .quad   0                   /* res2 (0x20) */
-    .quad   0                   /* res3 (0x28): following arm64 Image length — unused here */
-    .quad   0                   /* res4 (0x30): XNUP payload offset from _start (loader.c reads this) */
+    /* Linux ARM64 Image header (64 bytes) — v7: CLONE OF THE STOCK HEADER.
+       Boot headers (Android v4) are field-identical to stock; the arm64 Image
+       header inside the kernel blob is the remaining difference. Stock (known-
+       good under THIS ABL, silicon-proven by every normal boot): code0 =
+       0xfa405a4d (the EFI-stub MZ-encoding instruction), code1 = unconditional
+       branch to stext, text_offset = 0, image_size = 0x02380000, flags 0x0a,
+       res5 = 0x40 (PE header offset). We clone every field and only repoint
+       the branch to our own primary_entry. Six prior runs with the plain
+       header never executed a single instruction (104s ABL-watchdog). */
+    .word   0xfa405a4d          /* code0 — stock's exact first word ("MZ" pattern) */
+    b       primary_entry       /* code1 — stock entry shape: branch from +0x04 */
+    .quad   0                   /* text_offset = 0 (stock) */
+    .quad   0x02380000          /* image_size (stock value) */
+    .quad   0x0a                /* flags: LE, 4K, anywhere (stock) */
+    .quad   0                   /* res2 */
+    .quad   0                   /* res3 */
+    .quad   0                   /* res4: XNUP payload offset from _start (loader.c) */
     .ascii  "ARM\x64"
-    .word   0
+    .word   0x40                /* res5: PE header offset (stock) */
 
 primary_entry:
     msr     daifset, #0xf
