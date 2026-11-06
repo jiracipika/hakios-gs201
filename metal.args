@@ -1,7 +1,7 @@
 # what tools/metal-run.sh gives this phone (docs/porting/index.md): its big core and cores, its panel's rate,
 # how many threads copy frames, how often the touch screen is read. A line of boot-arguments; # is a comment.
 # fb_intf=<physical> as well, if its SoC's display interface is known: frames are then written behind the scan.
-# panther (gs201): 8 cores = 1x X1 (cpu7) + 3x A78 (cpu4-6) + 4x A55 (cpu0-3); panel 1080x2400 @ 90 Hz.
+# panther (gs201): 8 cores = 2x X1 (cpu6-7) + 2x A78 (cpu4-5) + 4x A55 (cpu0-3); panel 1080x2400 @ 90 Hz.
 # bootcpu=0 assumed (Exynos ABL enters the kernel on the first little core) — verify at M1 on hardware.
 # fb_threads=4 for 90 Hz (redwood uses 6 at 120 Hz); touch_poll 4 ms as upstream.
 bootcpu=0 cpus=8 fb_hz=90 fb_threads=4 touch_poll_us=4000

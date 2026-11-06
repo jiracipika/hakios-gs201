@@ -4,9 +4,10 @@
  * arm64 Image: MMU and caches off, x0 = ABL's device tree, at an ABL-chosen physical
  * base. All memory is device memory until XNU turns its MMU on, so the C is built
  * without SIMD and with strict alignment (build.sh).
- * The arm64 Image header carries, like mtkloader: res2 = length of a following arm64
- * Image (unused here), res3 = offset of the "XNUP" payload from _start (mkpayload.py
- * container). 0 means "no payload in the image" (QEMU -device loader test mode).
+ * The arm64 Image header carries, like mtkloader: res3 (0x28) = length of a following
+ * arm64 Image (unused here), res4 (0x30) = offset of the "XNUP" payload from _start —
+ * loader.c reads self+0x30, matching upstream's tools/chainboot.py (0x28 len, 0x30
+ * payload offset). 0 means "no payload in the image" (QEMU -device loader test mode).
  */
 .global _start
 .global gsloader_vectors
@@ -18,10 +19,10 @@ _start:
     .word   0                   /* code1 = exec below if entered as raw */
     .quad   0x80000             /* text_offset */
     .quad   0x02000000          /* image_size (covering; patched by mkboot if needed) */
-    .quad   0x0a                /* flags: little-endian, 4K pages, anywhere */
-    .quad   0                   /* res2 */
-    .quad   0                   /* res3: XNUP offset from _start (patched by mkboot) */
-    .quad   0                   /* res4 */
+    .quad   0x0a                /* flags 0x0a: LE (bit0=0), 4K pages (bits1-2=01), anywhere (bit3) */
+    .quad   0                   /* res2 (0x20) */
+    .quad   0                   /* res3 (0x28): following arm64 Image length — unused here */
+    .quad   0                   /* res4 (0x30): XNUP payload offset from _start (loader.c reads this) */
     .ascii  "ARM\x64"
     .word   0
 
@@ -47,7 +48,9 @@ primary_entry:
     ldr     x1, =__bss_end
 1:  cmp     x0, x1
     b.ge    2f
-    str     xzr, [x0], #8
+    str     wzr, [x0], #4     /* word stride: never writes past __bss_end (an appended
+                                  payload starts right after the image; an 8-byte stride
+                                  zeroed its first 4 bytes — the XNUP magic) */
     b       1b
 2:
     mov     x0, x19
@@ -55,20 +58,13 @@ primary_entry:
 3:  wfe
     b       3b
 
-/* progress codes land here before the reset heartbeat; a host reads them back
-   (phone: nothing yet; qemu: exit + log). x20 = code. */
-.global gsloader_progress
-gsloader_progress:
-    adrp    x21, progress_word
-    add     x21, x21, :lo12:progress_word
-    str     w20, [x21]
-    /* also mirror to the first page below _start for a warm-reboot reader */
-    ret
-
 /* PSCI system reset. ABI: x0 = conduit (0 = SMC, 1 = HVC, from the DTB's /psci
    method), w1 = progress code. progress_word bit31 = reset attempt in progress:
    a second trap parks instead of looping (an undefined conduit would otherwise
-   re-trap forever — qemu proved that with 822k exceptions). */
+   re-trap forever — qemu proved that with 822k exceptions). EL1 assumed: SMC/HVC
+   are undefined at EL2 (Pixel ABL enters the kernel at EL1; if that ever proves
+   wrong, an EL2->EL1 drop is needed before the call). Function ID 0x84000009 =
+   SYSTEM_RESET (0x...08 is SYSTEM_OFF — it powers the phone down, no reboot). */
 .global gsloader_reset
 gsloader_reset:
     adrp    x2, progress_word
@@ -77,11 +73,11 @@ gsloader_reset:
     str     w1, [x2]
     cmp     x0, #0
     b.ne    10f
-    movz    w0, #0x0008                 /* PSCI SYSTEM_RESET, 32-bit call = 0x84000008 */
+    movz    w0, #0x0009                 /* PSCI SYSTEM_RESET, 32-bit call = 0x84000009 */
     movk    w0, #0x8400, lsl #16
     smc     #0
     b       20f
-10: movz    w0, #0x0008
+10: movz    w0, #0x0009
     movk    w0, #0x8400, lsl #16
     hvc     #0
 20: wfe

@@ -23,7 +23,8 @@ struct fdt_header { uint32_t magic, totalsize, off_dt_struct, off_dt_strings, of
 #define FDT_PROP 3
 #define FDT_NOP 4
 #define FDT_END 9
-#define XNUP_MAGIC 0x50554e58u   /* "XNUP" read little-endian */
+#define XNUP_MAGIC 0x584e5550u   /* ASCII "XNUP" bytes as ld32 (big-endian) reads them;
+                                     the mtkloader reference native-reads the same bytes */
 
 static uint32_t ld32(const void *p) { uint32_t v; __builtin_memcpy(&v, p, 4); return __builtin_bswap32(v); }
 
@@ -83,13 +84,14 @@ static void walk_tree(const struct walker *w, struct banks *bk, int *addr_cells,
     }
 }
 
-/* XNUP discovery: Image-header res3 = payload offset from _start (boot image mode);
-   fallback: fixed 0xF0000000 (QEMU -device loader mode, like upstream's BootShim) —
-   but only if a parsed memory bank actually covers that address (blind probes fault). */
+/* XNUP discovery: Image-header res4 (file offset 0x30) = payload offset from _start
+   (boot image mode — upstream chainboot.py writes it there); fallback: fixed
+   0xF0000000 (QEMU -device loader mode, like upstream's BootShim) — but only if a
+   parsed memory bank actually covers that address (blind probes fault). */
 static const uint8_t *xnup_find(uintptr_t self, const struct banks *bk)
 {
-    uint64_t res3 = *(volatile uint64_t *)(self + 0x30);
-    if (res3 && ld32((const void *)(self + res3)) == XNUP_MAGIC) return (const uint8_t *)(self + res3);
+    uint64_t off = *(volatile uint64_t *)(self + 0x30);
+    if (off && ld32((const void *)(self + off)) == XNUP_MAGIC) return (const uint8_t *)(self + off);
     for (int i = 0; i < bk->n; i++) {
         uint64_t lo = bk->base[i], hi = lo + bk->size[i];
         if (0xF0000000ull >= lo && 0xF0000003ull < hi && ld32((const void *)0xF0000000ull) == XNUP_MAGIC)
