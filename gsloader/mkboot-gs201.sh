@@ -26,8 +26,23 @@ LZ4="${LZ4:-$HOME/.local/bin/lz4}"
 magic=$(dd if=gsloader.bin bs=1 skip=56 count=4 2>/dev/null)
 [ "$magic" = "$(printf 'ARM\x64')" ] || { echo "gsloader.bin: no arm64 Image header"; exit 1; }
 
+# ---- optional payload: XNUP appended at __loader_end (16-aligned), res4@0x30 patched ----
+BLOB=gsloader.bin
+if [ -f payload.bin ]; then
+  sig=$(dd if=payload.bin bs=1 count=4 2>/dev/null)
+  [ "$sig" = "XNUP" ] || { echo "payload.bin: not an XNUP container (mkpayload.py)"; exit 1; }
+  L=$(wc -c < gsloader.bin)
+  PADD=$(( (16 - L % 16) % 16 )); POFF=$((L + PADD))
+  { cat gsloader.bin; dd if=/dev/zero bs=1 count=$PADD 2>/dev/null; cat payload.bin; } > gsloader-pl.bin
+  # u64 LE of POFF into blob offset 0x30 (arm64 Image res4 — the payload offset slot)
+  le64() { n=$1; printf "$(printf '\\x%02x\\x%02x\\x%02x\\x%02x\\x%02x\\x%02x\\x%02x\\x%02x' $((n%256)) $((n/256%256)) $((n/65536%256)) $((n/16777216%256)) $((n/4294967296%256)) 0 0 0)"; }
+  le64 $POFF | dd of=gsloader-pl.bin bs=1 seek=$((0x30)) conv=notrunc 2>/dev/null
+  BLOB=gsloader-pl.bin
+  echo "payload: XNUP $(wc -c < payload.bin) bytes at blob offset $POFF (res4 patched)"
+fi
+
 # ---- kernel blob: lz4 legacy (stock Pixel 7 kernel format) ----
-"$LZ4" -l -9 -q -f gsloader.bin kernel.lz4
+"$LZ4" -l -9 -q -f "$BLOB" kernel.lz4
 sig=$(xxd -p -l 4 kernel.lz4)
 [ "$sig" = "02214c18" ] || { echo "kernel.lz4: not legacy lz4 (magic $sig)"; exit 1; }
 KSZ=$(wc -c < kernel.lz4)
@@ -50,7 +65,7 @@ mkhdr() { # mkhdr <kernel_size> <header_version> <header_size> <outfile>
 mkhdr "$KSZ" 4 1584 header.tmp
 cat header.tmp kernel.lz4 > panther-boot.img
 
-# 2) raw variant (bisect compression variable)
+# 2) raw variant (bisect compression variable; no payload — loader-only)
 cp gsloader.bin kernel.raw
 RAWKSZ=$(wc -c < kernel.raw)
 mkhdr "$RAWKSZ" 4 1584 header2.tmp
@@ -75,6 +90,6 @@ if [ -n "$STOCK_BOOT" ]; then
   fi
   echo "avb variant: stock vbmeta at $VBMETA_OFF kept, our kernel at 4096 (len $KSZ)"
 fi
-rm -f header.tmp kernel.lz4
+rm -f header.tmp kernel.lz4 gsloader-pl.bin
 
 ls -la panther-boot.img panther-boot-raw-v4.img panther-boot-avb.img 2>/dev/null

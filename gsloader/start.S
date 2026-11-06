@@ -83,6 +83,13 @@ gsloader_reset:
 20: wfe
     b       20b
 
+/* Jump to the payload kernel: x0 = entry address, x1 = device tree. ABL entered us
+   with MMU/caches off and we never enabled them, so there is nothing to tear down;
+   the payload inherits exactly the state ABL gave us (+ a saved copy of nothing). */
+.global gsloader_jump
+gsloader_jump:
+    br      x0
+
 /* any exception: one HVC-first reset attempt, then park. No recursion. */
 .global gsloader_trap
 gsloader_trap:

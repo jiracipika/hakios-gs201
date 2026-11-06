@@ -11,6 +11,7 @@
 #include <stddef.h>
 
 void gsloader_reset(uint64_t conduit, uint32_t code);
+void gsloader_jump(uint64_t entry, uint64_t dtb);
 
 extern uint8_t _start[];
 volatile uint32_t progress_word;
@@ -100,6 +101,26 @@ static const uint8_t *xnup_find(uintptr_t self, const struct banks *bk)
     return 0;
 }
 
+/* XNUP container (upstream xnuloader/mkpayload.py): u32 magic "XNUP", u32 body size,
+   then entries: name[16] + u32 size + u32 reserved + data padded to 16; an entry
+   whose name is empty ends the list. Returns the "kernel" entry's data, or 0. */
+static const uint8_t *xnup_kernel(const uint8_t *c)
+{
+    uint32_t body = ld32(c + 4);
+    const uint8_t *end = c + 8 + body;
+    const uint8_t *p = c + 8;
+    while (p + 24 <= end) {
+        const char *name = (const char *)p;
+        if (!name[0]) return 0;                                   /* end-of-list */
+        uint32_t size = ld32(p + 16);
+        const uint8_t *data = p + 24;
+        if (data + size > end) return 0;                           /* corrupt */
+        if (!__builtin_memcmp(name, "kernel", 6)) return data;
+        p = (const uint8_t *)(((uintptr_t)data + size + 15) & ~15ull);
+    }
+    return 0;
+}
+
 void gsloader_main(uint64_t dtb)
 {
     struct fdt_header h;
@@ -116,12 +137,16 @@ void gsloader_main(uint64_t dtb)
     if (bk.size[0] < (64ull << 20)) gsloader_reset(0, 0xF2);      /* bank looks wrong */
 
     const uint8_t *x = xnup_find((uintptr_t)_start, &bk);
-    /* gsloader_reset conduit arg: 0 = SMC, 1 = HVC (from the DTB's /psci method;
-       default SMC — qemu virt and Pixel ABL both default to it).
-       reset code = what was learned:
-         0xB0 memory parsed, XNUP payload found
-         0xB1 memory parsed, no payload (the plain heartbeat boot image) */
-    gsloader_reset(psci_hvc < 0 ? 0 : (uint64_t)psci_hvc, x ? 0xB0u : 0xB1u);
+    if (!x)
+        gsloader_reset(psci_hvc < 0 ? 0 : (uint64_t)psci_hvc, 0xB1u);  /* no payload: heartbeat image */
+
+    /* payload present: find the kernel entry, check its arm64 Image header, jump.
+       The payload inherits ABL's state (MMU/caches off) and gets x0 = DTB. */
+    const uint8_t *k = xnup_kernel(x);
+    if (!k) gsloader_reset(0, 0xB3u);                             /* XNUP but no kernel entry */
+    if (__builtin_memcmp(k + 0x38, "ARM\x64", 4)) gsloader_reset(0, 0xB4u);  /* not an arm64 Image */
+    gsloader_jump((uintptr_t)k, dtb);
+    gsloader_reset(0, 0xB5u);                                     /* jump returned?! */
 }
 
 /* ---- freestanding: clang lowers the builtins to these calls (mtkloader does the same) ---- */
