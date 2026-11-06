@@ -44,8 +44,43 @@ primary_entry:
     add     x2, x2, :lo12:gsloader_vectors
     cmp     x1, #2
     b.ne    10f
+    /* v10 EL2 normalization — ported verbatim from PixOS shim/start.S
+       (silicon-proven on bluejay/gs101 under the same ABL family; AOSP AVF
+       doc: "The bootloader enters the generic kernel at EL2"). Normalize the
+       EL2 environment, prepare a clean EL1, then eret DOWN to EL1 — all of
+       gsloader, the payload and XNU itself run at EL1 from here. */
     msr     vbar_el2, x2
-    b       20f
+    msr     vbar_el1, x2
+    movz    x2, #0x8000
+    msr     hcr_el2, x2                 /* HCR_EL2 = RW only (AArch64 EL1; AMO/IMO/FMO=0) */
+    mrs     x2, midr_el1
+    msr     vpidr_el2, x2
+    mrs     x2, mpidr_el1
+    msr     vmpidr_el2, x2
+    /* SCTLR_EL1 with MMU/C/I off + ARMv8.2 RES1 bits (PixOS): EOS|EIS|SPAN|
+       nTLSMD|LSMAOE|TSCXT = (1<<29)|(1<<28)|(1<<23)|(1<<22)|(1<<20)|(1<<11)
+       = 0x30d00800 */
+    movz    x2, #0x0800
+    movk    x2, #0x30d0, lsl #16
+    msr     sctlr_el1, x2
+    msr     cptr_el2, xzr               /* no FP/SIMD traps to EL2 */
+    msr     hstr_el2, xzr               /* no CP15 traps to EL2 */
+    mov     x2, #3                      /* CNTHCTL_EL2: EL1PCTEN | EL1PCEN */
+    msr     cnthctl_el2, x2
+    msr     cntvoff_el2, xzr
+    msr     vttbr_el2, xzr
+    mrs     x3, icc_sre_el2
+    movz    x2, #0x0009                 /* SRE (bit0) | Enable (bit3) — GICv3 sysreg mode */
+    orr     x2, x3, x2
+    msr     icc_sre_el2, x2
+    dsb     sy
+    isb
+    adr     x2, 20f
+    msr     elr_el2, x2
+    movz    x2, #0x3c5                  /* SPSR: EL1h, DAIF masked */
+    msr     spsr_el2, x2
+    mov     x0, x19
+    eret                                /* drop to EL1, continue at label 20 */
 10: msr     vbar_el1, x2
 20:
     /* stack just below the load address, BSS cleared.
