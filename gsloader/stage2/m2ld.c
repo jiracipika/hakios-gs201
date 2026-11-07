@@ -657,25 +657,32 @@ static uint64_t mem_top_for(uint64_t pb)
     return pb >= 0x800000000ull ? pb + 0x40000000ull : XNU_MEM_TOP;
 }
 
-/* pick a phys window: probe 2 MiB steps over [pb, pb+span); rw-check the ends;
- * never overlap the GSPE payload source (ramdisk region) */
+/* pick a phys window: probe 2 MiB steps over the USED span only (segments
+ * sit at pb+(vm_lo-KVB) .. pb+(vm_hi-KVB); the 48 MB prelink gap below
+ * vm_lo is never touched); rw-check the ends; never overlap the GSPE
+ * source region (the download buffer's payload). */
 static uint64_t g_gspe_lo, g_gspe_hi;
 static uint64_t g_rd_start, g_rd_end;
+static uint64_t vm_lo_g = KVB + 0x3004000ull;   /* defaults = real __TEXT */
+static uint64_t vm_hi_g = KVB + 0x42d9b10ull;   /* ...and vm_hi from the build */
 
 static int window_ok(uint64_t pb, uint64_t span)
 {
+    (void)span;
+    uint64_t lo = pb + (vm_lo_g - KVB);
+    uint64_t hi = pb + (vm_hi_g - KVB) + 0x200000;
     if (pb & 0x1fffff) return 0;
-    if (pb + span >= mem_top_for(pb)) return 0;
+    if (hi >= mem_top_for(pb)) return 0;
     if (g_gspe_hi > g_gspe_lo &&
-        pb < g_gspe_hi && pb + span > g_gspe_lo) return 0;
-    for (uint64_t a = pb; a < pb + span; a += 0x200000) {
+        lo < g_gspe_hi && hi > g_gspe_lo) return 0;
+    for (uint64_t a = lo; a < hi; a += 0x200000) {
         if (!try_map(a)) {
             plog_str("unmapped @"); plog_hex(a);
             return 0;
         }
     }
-    if (!try_rw(pb + 0x1000)) { plog_str("rw-fail @pb\n"); return 0; }
-    if (!try_rw(pb + span - 0x200000 + 0x1000)) { plog_str("rw-fail @end\n"); return 0; }
+    if (!try_rw(lo + 0x1000)) { plog_str("rw-fail @lo\n"); return 0; }
+    if (!try_rw(hi - 0x200000 + 0x1000)) { plog_str("rw-fail @end\n"); return 0; }
     return 1;
 }
 
@@ -759,12 +766,11 @@ static const struct gspe_hdr *gspe_find(uint64_t dtb_pa)
         }
     }
 
-    /* 3) DRAM scan, 4 KiB steps (the ramdisk load address may be any page;
-       ABL passes the initramfs through, our raw-GSPE vehicle keeps it
-       uncompressed so the magic is scannable). Low bank above our image,
-       then the high bank. Probes are cheap: faults skip in ~50 cycles. */
+    /* 3) DRAM scan, 4 KiB steps: the FULL low bank (the 64MB download
+       buffer — which carries our GSPE in the container at +0x2000000 —
+       can sit anywhere) then the high bank. Faults skip cheaply. */
     if (!h) {
-        for (uint64_t a = 0x82300000ull; a < 0xe8000000ull; a += 0x1000) {
+        for (uint64_t a = 0x80000000ull; a < 0x100000000ull; a += 0x1000) {
             h = gspe_check(a);
             if (h) { plog_str("gspe=scan "); plog_hex(a); break; }
         }
@@ -840,6 +846,8 @@ void m2ld_main(uint64_t ax0, uint64_t ax1, uint64_t self, uint64_t mpidr,
         if (segs[i].vmaddr < vm_lo) vm_lo = segs[i].vmaddr;
         if (segs[i].vmaddr + segs[i].vmsize > vm_hi) vm_hi = segs[i].vmaddr + segs[i].vmsize;
     }
+    vm_lo_g = vm_lo;
+    vm_hi_g = vm_hi;
     plog_str("gspe nsegs="); plog_dec(h->nsegs);
     plog_str(" ksize=");     plog_dec(h->kernel_size);
     plog_str(" entry_va=");  plog_hex(h->entry_va);
