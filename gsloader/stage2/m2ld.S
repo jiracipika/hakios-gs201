@@ -67,9 +67,13 @@ _start:
     b       3b
 
 /*
- * m2ld_jump(entry_pa, boot_args_pa) — enter XNU at EL1h, MMU stays ON.
- * D-cache for everything we copied is cleaned by the caller; the ic iallu here
- * makes the freshly-memcpy'd instructions visible to fetch.
+ * m2ld_jump(entry_pa, boot_args_pa, l1_table_pa) — enter XNU at EL1h.
+ * On the EL2 path, install a minimal EL1 identity regime BEFORE the eret
+ * (mtkloader's proven recipe: T0SZ 25 -> TTBR0 points at an L1 of 1 GB
+ * blocks; TCR 0x200803519; MAIR 0xff00 attr1 = normal WB; L1 entries for
+ * the low bank and the high bank built by the caller). Without this, the
+ * eret lands in whatever EL1 regime ABL left — possibly unmapped — and the
+ * first fetch faults into a garbage VBAR: the v15 silent hang.
  */
 m2ld_jump:
     msr     daifset, #0xf
@@ -87,6 +91,22 @@ m2ld_jump:
     orr     x2, x2, #(1 << 31)            /* RW: EL1 is AArch64 */
     bic     x2, x2, #(1 << 27)            /* TGE off */
     msr     hcr_el2, x2
+    /* minimal EL1 identity regime (x2 = L1 table PA) */
+    ldr     x3, =0xff00
+    msr     mair_el1, x3                  /* attr1 = normal WB */
+    ldr     x3, =0x200803519
+    msr     tcr_el1, x3                   /* T0SZ25, IPS40, EPD1, WB */
+    msr     ttbr0_el1, x2
+    isb
+    tlbi    vmalle1
+    dsb     sy
+    isb
+    mrs     x3, sctlr_el1
+    orr     x3, x3, #0x1                  /* M */
+    orr     x3, x3, #0x4                  /* C */
+    orr     x3, x3, #0x1000               /* I */
+    msr     sctlr_el1, x3
+    isb
     mov     w2, #0x3c5                    /* EL1h, DAIF masked */
     msr     spsr_el2, x2
     msr     elr_el2, x16

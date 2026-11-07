@@ -627,7 +627,28 @@ _Static_assert(__builtin_offsetof(struct boot_args, bootFlags) == 720, "ba");
 /* =====================================================================
  * main
  * ===================================================================== */
-void m2ld_jump(uint64_t entry_pa, uint64_t args_pa);
+void m2ld_jump(uint64_t entry_pa, uint64_t args_pa, uint64_t l1_pa);
+
+static uint64_t g_img_base, g_self, g_pb;
+
+/* Build the minimal EL1 identity L1 (1 GB blocks, mtkloader's proven
+ * recipe): entry[2] = low bank (image, window, boot_args), entry[34] =
+ * high-bank window candidate. Table at img+0x1c00000 (4 KB aligned, below
+ * the stack region). Descriptor: AttrIdx=1 (MAIR 0xff00 attr1 = normal
+ * WB), AF, SH inner. */
+#define L1_TABLE_OFF  0x1c00000u
+static uint64_t g_l1_pa;
+
+static void build_el1_map(void)
+{
+    volatile uint64_t *l1 = (volatile uint64_t *)(uintptr_t)(g_img_base + L1_TABLE_OFF);
+    for (int i = 0; i < 512; i++) l1[i] = 0;
+    l1[2]  = 0x80000000ull | 0x705ull;   /* 1 GB block, normal WB */
+    l1[34] = 0x880000000ull | 0x705ull;
+    __asm__ volatile("dsb sy" ::: "memory");
+    m2ld_clean(g_img_base + L1_TABLE_OFF, 0x1000);
+    g_l1_pa = g_img_base + L1_TABLE_OFF;
+}
 
 /* bisection ladder: build with -DM2LD_EXIT_AT=n to arm the instant wdt at
    stage n (band ~30 s) instead of running on; 0 = full path */
@@ -995,7 +1016,8 @@ void m2ld_main(uint64_t ax0, uint64_t ax1, uint64_t self, uint64_t mpidr,
     EXIT_AT(7);
 
     plog_str("JUMP\n"); plog_sync();
-    m2ld_jump(h->entry_va + slide, ba_pa);
+    build_el1_map();
+    m2ld_jump(h->entry_va + slide, ba_pa, g_l1_pa);
 
     /* never reached; belt and braces */
     plog_str("err B5 jump-returned\n"); plog_sync();
