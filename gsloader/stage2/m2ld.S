@@ -159,32 +159,31 @@ m2ld_return_stub:
        returned through the slot. */
     cmp     x2, #2
     b.ne    8f
-    movz    w15, #0x3a98                 /* 750 Hz x 20 s (16-bit WTCNT) */
+    movz    w15, #0x3a98                 /* (unused now — both paths instant) */
     b       9f
-8:  mov     w15, #0x80                   /* ~instant timeout */
-9:  movz    x13, #0x0000
-    movk    x13, #0x1006, lsl #16        /* WDT_CL0 @ 0x10060000 */
+8:  mov     w15, #0x80
+9:  /* arm the EMPIRICAL wdt (0x200c4000/0x200c5000) with the PROVEN instant
+       recipe — the only reset that fires from this context (rdscan 29 s
+       proved the arm alone resets; the SMC presets recovery mode) */
+    movz    x13, #0x4000
+    movk    x13, #0x200c, lsl #16
     bl      stub_arm
-    movz    x13, #0x0000
-    movk    x13, #0x1007, lsl #16        /* WDT_CL1 @ 0x10070000 */
+    movz    x13, #0x5000
+    movk    x13, #0x200c, lsl #16
     bl      stub_arm
     b       19f
-/* stub_arm: x13 = wdt base, w15 = count; kernel-style start sequence */
 stub_arm:
-    ldr     w14, [x13]
-    bic     w14, w14, #0x1               /* ~RSTEN */
-    bic     w14, w14, #0x20              /* ~ENABLE -> stop */
-    str     w14, [x13]
-    str     w15, [x13, #4]               /* WTDAT = reload */
-    str     w15, [x13, #8]               /* WTCNT */
-    cmp     w15, #0x80
-    b.ls    15f                          /* instant: no prescale needed */
-    movz    w14, #0xff39
-    movk    w14, #0x10, lsl #16          /* DBGACK|PRE255|DIV128|EN|RST */
-    b       16f
-15: movz    w14, #0x0039
-    movk    w14, #0x10, lsl #16          /* DBGACK|DIV128|EN|RST */
-16: str     w14, [x13]
+    movz    w21, #0xffee
+    movk    w21, #0xc0, lsl #16          /* KEY */
+    str     w21, [x13, #4]
+    str     wzr, [x13]
+    mov     w21, #0x100
+    str     w21, [x13, #16]              /* WTMINCNT */
+    mov     w21, #0x80
+    str     w21, [x13, #8]               /* WTCNT < MINCNT -> violation now */
+    movz    w21, #0x2021
+    movk    w21, #0x10, lsl #16          /* 0x102021 */
+    str     w21, [x13]
     ret
 19:
     /* clean the record + plog head so they survive the reset */

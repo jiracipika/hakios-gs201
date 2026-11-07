@@ -252,13 +252,17 @@ static void wdt_pmu_enable(void)
     __asm__ volatile("dsb sy" ::: "memory");
 }
 
-/* HANDS-OFF WATCHDOG POLICY (v13): writes to the real wdt at 0x1006/0x1007
- * STOP ABL's watchdog fine, but no arm sequence we've tried (kernel-exact,
- * PMU counter-enable + reset-unmask, with/without DBGACK, slow/fast tick)
- * produces a reset from this context — every armed run just hangs. So we
- * touch NOTHING: ABL's own watchdog is the failsafe (it reaped every hung
- * run today). All error paths park; ABL decides when to reset. */
-static void wdt_arm_instant(uint64_t base) { (void)base; }
+/* WATCHDOG POLICY v15: the SMC in preset_recovery_mode is ITSELF a fast
+ * deterministic reset (every 29-31 s band of the day = that SMC; the
+ * countdown tests were void — they ran on the never-executing big vehicle).
+ * So: error paths PARK (ABL's own wdt reaps at ~104 s — unambiguous),
+ * the XNULDRST stub resets FAST via the 0x200c4xxx instant recipe (30 s,
+ * unambiguous "XNU crashed"), and the success path touches NOTHING
+ * (ABL's wdt stays as the hang failsafe) and just jumps. */
+static void wdt_arm_instant(uint64_t base)
+{
+    (void)base;                                    /* intentionally unused */
+}
 
 /* Count-only for ~1 s on CL0's counter at the fast tick to derive the real
  * PCLK; falls back to 24.576 MHz. WTCNT is 16-bit: start from 0xFFFF. */
@@ -982,22 +986,12 @@ void m2ld_main(uint64_t ax0, uint64_t ax1, uint64_t self, uint64_t mpidr,
         }
     }
 
-    /* ---- watchdog: calibrated ~45 s window, fallback instant ---- */
-    {
-        wdt_pmu_enable();
-        uint64_t rate = wdt_calibrate();
-        plog_str("wdt-rate="); plog_dec(rate); plog_sync();
-        preset_recovery_mode();            /* post-run reset -> recovery */
-        if (rate >= 1000000ull) {
-            wdt_arm_windowed(WDT_CL0, rate, 45);
-            wdt_arm_windowed(WDT_CL1, rate, 45);
-            plog_str("wdt armed 45s\n");
-        } else {
-            plog_str("wdt cal failed -> instant\n");
-            wdt_arm_instant(WDT_CL0); wdt_arm_instant(WDT_CL1);
-        }
-        plog_sync();
-    }
+    /* ---- success path: touch NOTHING (ABL's own wdt = the hang failsafe;
+     * the SMC would reset before the jump) and jump. If XNU crashes, its
+     * XNULDRST early-exception path br's to the stub: URET record (MMU off =
+     * physical write works) + SMC recovery preset + instant 0x200c4xxx arm
+     * -> fast reset into TWRP with the report. ~104 s back = an error path
+     * parked; silence = XNU alive (or ABL's wdt reaping a later hang). ---- */
     EXIT_AT(7);
 
     plog_str("JUMP\n"); plog_sync();
@@ -1005,7 +999,6 @@ void m2ld_main(uint64_t ax0, uint64_t ax1, uint64_t self, uint64_t mpidr,
 
     /* never reached; belt and braces */
     plog_str("err B5 jump-returned\n"); plog_sync();
-    wdt_arm_instant(WDT_CL0); wdt_arm_instant(WDT_CL1);
     for (;;) __asm__ volatile("wfe");
 }
 
